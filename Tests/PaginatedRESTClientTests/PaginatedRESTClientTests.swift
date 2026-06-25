@@ -4,7 +4,7 @@ import Testing
 
 // MARK: - Test doubles
 
-/// A minimal error mapping: the transport names no domain error, so the tests supply a
+/// A minimal error mapping: the paginator names no domain error, so the tests supply a
 /// trivial one and treat HTTP 5xx/429 and `URLError`s as transient.
 private struct TestErrors: RESTTransportErrorMapping {
     enum Failure: Error, Equatable {
@@ -61,20 +61,13 @@ private nonisolated struct ThingsPage: PagedResponse {
     enum CodingKeys: String, CodingKey { case things; case nextPage = "next_page"; case total }
 }
 
-/// Serves a fixed two-page fixture keyed off the `page` query item, so pagination can be
-/// exercised with no real networking. `nonisolated` because the URL loading system calls
-/// `startLoading()` off the main actor (matching the module's MainActor default isolation).
-private final nonisolated class StubURLProtocol: URLProtocol {
-    override static func canInit(with _: URLRequest) -> Bool {
-        true
-    }
-
-    override static func canonicalRequest(for request: URLRequest) -> URLRequest {
-        request
-    }
-
-    override func startLoading() {
-        let page = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?
+/// Serves a fixed two-page fixture keyed off the `page` query item, with no real
+/// networking — a `RESTTransport` stub in place of the old `URLProtocol`/`URLSession`
+/// machinery, so the tests exercise the paginator over the same seam consumers use and
+/// stay Foundation-only (Linux-clean).
+private struct StubTransport: RESTTransport {
+    func data(for request: RESTRequest) async throws -> (Data, Int) {
+        let page = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?
             .queryItems?.first { $0.name == "page" }?.value
         let json = switch page {
         case nil, "1":
@@ -84,26 +77,18 @@ private final nonisolated class StubURLProtocol: URLProtocol {
         default:
             #"{"things":[],"next_page":null,"total":3}"#
         }
-        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
-        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: Data(json.utf8))
-        client?.urlProtocolDidFinishLoading(self)
+        return (Data(json.utf8), 200)
     }
-
-    override func stopLoading() {}
 }
 
-private func makeClient() -> PaginatedRESTClient {
-    let config = URLSessionConfiguration.ephemeral
-    config.protocolClasses = [StubURLProtocol.self]
-    return PaginatedRESTClient(
+private func makeClient(transport: any RESTTransport = StubTransport()) -> PaginatedRESTClient {
+    PaginatedRESTClient(
         apiKey: "test-key",
         baseURL: URL(string: "https://example.test")!,
-        session: URLSession(configuration: config),
+        transport: transport,
         decoderFactory: { JSONDecoder() },
         encoderFactory: { JSONEncoder() },
-        errors: TestErrors(),
-        logger: .init(subsystem: "PaginatedRESTClientTests", category: "test")
+        errors: TestErrors()
     )
 }
 
@@ -130,19 +115,37 @@ struct PaginatedRESTClientTests {
 
     @Test
     func `an empty API key fails before any request`() async throws {
-        let config = URLSessionConfiguration.ephemeral
-        config.protocolClasses = [StubURLProtocol.self]
-        let client = try PaginatedRESTClient(
+        let client = PaginatedRESTClient(
             apiKey: "",
-            baseURL: #require(URL(string: "https://example.test")),
-            session: URLSession(configuration: config),
+            baseURL: try #require(URL(string: "https://example.test")),
+            transport: StubTransport(),
             decoderFactory: { JSONDecoder() },
             encoderFactory: { JSONEncoder() },
-            errors: TestErrors(),
-            logger: .init(subsystem: "PaginatedRESTClientTests", category: "test")
+            errors: TestErrors()
         )
         await #expect(throws: TestErrors.Failure.missingAPIKey) {
             _ = try await client.fetch(Thing.self, path: "/things/1")
+        }
+    }
+
+    @Test
+    func `the paginator authorizes requests with a bearer token`() async throws {
+        let request = makeClient().authorizedGET(try #require(URL(string: "https://example.test/things/")))
+        #expect(request.method == "GET")
+        #expect(request.headers["Authorization"] == "Bearer test-key")
+        #expect(request.headers["Accept"] == "application/json")
+    }
+
+    @Test
+    func `a non-2xx status surfaces as a mapped HTTP error`() async throws {
+        struct FailingTransport: RESTTransport {
+            func data(for _: RESTRequest) async throws -> (Data, Int) {
+                (Data("nope".utf8), 404)
+            }
+        }
+        await #expect(throws: TestErrors.Failure.http(404)) {
+            _ = try await makeClient(transport: FailingTransport())
+                .fetch(Thing.self, path: "/things/1")
         }
     }
 }

@@ -2,20 +2,20 @@
 //  PaginatedRESTClient.swift
 //  PaginatedRESTClient
 //
-//  A generic, domain-free transport for paginated, bearer-authenticated REST APIs:
+//  A generic, domain-free paginator for paginated, bearer-authenticated REST APIs:
 //  request building, retry with exponential backoff, concurrent multi-page fetching,
-//  and background JSON decoding. The transport concern is reusable and unit-testable
+//  and background JSON decoding. The pagination concern is reusable and unit-testable
 //  apart from any domain-specific models and endpoints, which compose it.
 //
-//  The decoder, request-body encoder, error mapping, and logger are all injected, so
-//  nothing here knows any particular API's date quirks, model shapes, error type, or
-//  logging subsystem. The transport builds its failures through an injected
-//  `RESTTransportErrorMapping` rather than naming a domain error, so it carries no
-//  coupling to any one API.
+//  The networking backend, decoder, request-body encoder, error mapping, and logger are
+//  all injected, so nothing here knows any particular API's HTTP stack, date quirks,
+//  model shapes, error type, or logging subsystem. The byte-level networking is hidden
+//  behind `RESTTransport` (see `URLSessionTransport` for the default), and failures are
+//  built through an injected `RESTTransportErrorMapping` rather than naming a domain
+//  error, so the paginator carries no coupling to any one API or HTTP client.
 //
 
 import Foundation
-import os
 
 // MARK: - Pagination
 
@@ -69,30 +69,33 @@ public protocol RESTTransportErrorMapping: Sendable {
 
 // MARK: - Client
 
-/// The reusable transport. Carries only immutable, Sendable configuration and drives
-/// pure networking, so its stored properties and the low-level request/pagination
-/// methods are `nonisolated`: it lets the pagination pipeline run off the main actor
-/// (see `streamAllPages`) rather than being pinned to it by the module's default
-/// MainActor isolation.
+/// The reusable paginator. Carries only immutable, Sendable configuration and drives
+/// pure networking through an injected `RESTTransport`, so its stored properties and the
+/// low-level request/pagination methods are `nonisolated`: it lets the pagination
+/// pipeline run off the main actor (see `streamAllPages`) rather than being pinned to it
+/// by the module's default MainActor isolation.
 public struct PaginatedRESTClient {
     nonisolated let apiKey: String
     nonisolated let baseURL: URL
-    nonisolated let session: URLSession
+    /// The networking backend. `URLSessionTransport` by default; inject any `RESTTransport`
+    /// to layer the paginator over a different HTTP client (Get, Alamofire) or a test stub.
+    nonisolated let transport: any RESTTransport
     /// Builds a configured decoder per call. A factory rather than a shared instance
     /// because decoding runs off the main actor (see `perform`) and `JSONDecoder`
     /// isn't safe to share across threads — each background decode gets its own.
     nonisolated let decoderFactory: @Sendable () -> JSONDecoder
     /// Supplies the encoder for request bodies. A closure (not a stored `JSONEncoder`)
-    /// so the transport stays `Sendable` — its `nonisolated` pagination methods capture
+    /// so the paginator stays `Sendable` — its `nonisolated` pagination methods capture
     /// `self` in child tasks, and `JSONEncoder` isn't `Sendable`. The composing client
     /// owns the body shapes and date strategy, so the encoder is a domain concern.
     nonisolated let encoderFactory: @Sendable () -> JSONEncoder
-    /// Builds the transport's failures as the composing client's error type, so this file
+    /// Builds the paginator's failures as the composing client's error type, so this file
     /// names no domain error (see `RESTTransportErrorMapping`).
     nonisolated let errors: any RESTTransportErrorMapping
-    /// Where retry diagnostics go. Injected so the package owns no logging subsystem;
-    /// `Logger` is `Sendable`, so it travels into the nonisolated pagination methods.
-    nonisolated let logger: Logger
+    /// Where retry diagnostics go. A plain `@Sendable` closure so the package owns no
+    /// logging subsystem and stays Foundation-only; defaults to a no-op. Bridge it to
+    /// `os.Logger`, `print`, or any sink at the call site.
+    nonisolated let log: @Sendable (String) -> Void
 
     /// Upper bound on `next_page` follows for one list, guarding against a server
     /// that keeps handing back links. Hitting it throws rather than truncating.
@@ -101,27 +104,27 @@ public struct PaginatedRESTClient {
     public init(
         apiKey: String,
         baseURL: URL,
-        session: URLSession,
+        transport: any RESTTransport = URLSessionTransport(),
         decoderFactory: @escaping @Sendable () -> JSONDecoder,
         encoderFactory: @escaping @Sendable () -> JSONEncoder,
         errors: any RESTTransportErrorMapping,
-        logger: Logger
+        log: @escaping @Sendable (String) -> Void = { _ in }
     ) {
         self.apiKey = apiKey
         self.baseURL = baseURL
-        self.session = session
+        self.transport = transport
         self.decoderFactory = decoderFactory
         self.encoderFactory = encoderFactory
         self.errors = errors
-        self.logger = logger
+        self.log = log
     }
 
-    public nonisolated func authorizedGET(_ url: URL) -> URLRequest {
-        var request = URLRequest(url: url)
-        request.httpMethod = "GET"
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        return request
+    public nonisolated func authorizedGET(_ url: URL) -> RESTRequest {
+        RESTRequest(
+            url: url,
+            method: "GET",
+            headers: ["Authorization": "Bearer \(apiKey)", "Accept": "application/json"]
+        )
     }
 
     public func fetch<T: Decodable & Sendable>(_ type: T.Type, path: String) async throws -> T {
@@ -335,7 +338,7 @@ public struct PaginatedRESTClient {
     /// requests go straight through `perform` to avoid duplicating side effects.
     public nonisolated func performWithRetry<T: Decodable & Sendable>(
         _ type: T.Type,
-        request: URLRequest,
+        request: RESTRequest,
         maxAttempts: Int = 3
     ) async throws -> T {
         var attempt = 0
@@ -346,12 +349,7 @@ public struct PaginatedRESTClient {
                 attempt += 1
                 guard attempt < maxAttempts, errors.isTransient(error) else { throw error }
 
-                logger.debug(
-                    """
-                    Transient failure on \(request.url?.path ?? "", privacy: .public); \
-                    retry \(attempt)/\(maxAttempts - 1)
-                    """
-                )
+                log("Transient failure on \(request.url.path); retry \(attempt)/\(maxAttempts - 1)")
                 // 300ms, then 600ms. Let cancellation propagate so a torn-down
                 // stream stops here rather than issuing another request.
                 try await Task.sleep(for: .milliseconds(300 * (1 << (attempt - 1))))
@@ -367,31 +365,32 @@ public struct PaginatedRESTClient {
     ) async throws -> T {
         guard !apiKey.isEmpty else { throw errors.missingAPIKey() }
 
-        var request = URLRequest(url: baseURL.appending(path: path))
-        request.httpMethod = method
-        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try encoderFactory().encode(body)
+        let request = RESTRequest(
+            url: baseURL.appending(path: path),
+            method: method,
+            headers: [
+                "Authorization": "Bearer \(apiKey)",
+                "Accept": "application/json",
+                "Content-Type": "application/json"
+            ],
+            body: try encoderFactory().encode(body)
+        )
         return try await perform(type, request: request)
     }
 
-    public func perform<T: Decodable & Sendable>(_ type: T.Type, request: URLRequest) async throws -> T {
+    public func perform<T: Decodable & Sendable>(_ type: T.Type, request: RESTRequest) async throws -> T {
         let data: Data
-        let response: URLResponse
+        let status: Int
         do {
-            (data, response) = try await session.data(for: request)
+            (data, status) = try await transport.data(for: request)
         } catch let urlError as URLError {
             // Surface transport failures (offline, timeout, unreachable) as a typed,
             // friendly error rather than leaking the raw URLError into the UI.
             throw errors.network(urlError)
         }
-        guard let http = response as? HTTPURLResponse else {
-            throw errors.http(status: 0, body: "No HTTP response")
-        }
-        guard (200 ..< 300).contains(http.statusCode) else {
+        guard (200 ..< 300).contains(status) else {
             let body = String(data: data, encoding: .utf8) ?? ""
-            throw errors.http(status: http.statusCode, body: body)
+            throw errors.http(status: status, body: body)
         }
 
         do {
