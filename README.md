@@ -3,6 +3,8 @@
 A pluggable, dependency-free Swift paginator for bearer-authenticated REST APIs.
 
 [![CI](https://github.com/adamtheturtle/PaginatedRESTClient/actions/workflows/ci.yml/badge.svg)](https://github.com/adamtheturtle/PaginatedRESTClient/actions/workflows/ci.yml)
+[![](https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2Fadamtheturtle%2FPaginatedRESTClient%2Fbadge%3Ftype%3Dswift-versions)](https://swiftpackageindex.com/adamtheturtle/PaginatedRESTClient)
+[![](https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2Fadamtheturtle%2FPaginatedRESTClient%2Fbadge%3Ftype%3Dplatforms)](https://swiftpackageindex.com/adamtheturtle/PaginatedRESTClient)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 `PaginatedRESTClient` turns a paginated, bearer-token REST endpoint into a single call —
