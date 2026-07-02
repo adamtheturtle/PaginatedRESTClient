@@ -1,6 +1,5 @@
-# Swift Package Index configuration.
-# Drives documentation generation for the package on https://swiftpackageindex.com.
 version: 1
 builder:
   configs:
-    - documentation_targets: [PaginatedRESTClient]
+    - documentation_targets:
+        - PaginatedRESTClient
