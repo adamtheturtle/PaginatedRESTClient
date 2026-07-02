@@ -62,7 +62,7 @@ private nonisolated struct ThingsPage: PagedResponse {
 }
 
 /// Serves a fixed two-page fixture keyed off the `page` query item, with no real
-/// networking — a `RESTTransport` stub in place of the old `URLProtocol`/`URLSession`
+/// networking - a `RESTTransport` stub in place of the old `URLProtocol`/`URLSession`
 /// machinery, so the tests exercise the paginator over the same seam consumers use and
 /// stay Foundation-only (Linux-clean).
 private struct StubTransport: RESTTransport {

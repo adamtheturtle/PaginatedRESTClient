@@ -9,14 +9,14 @@ public protocol RESTTransport: Sendable {
 ```
 
 A transport executes a `RESTRequest` and returns the response body and HTTP status code.
-That's the whole contract — **no decoding, no retry, no auth.** All of that stays in the
+That's the whole contract - **no decoding, no retry, no auth.** All of that stays in the
 paginator, so a transport is a thin translation from `RESTRequest` to whatever your HTTP
 client understands and back.
 
 The package ships [`URLSessionTransport`](../Sources/PaginatedRESTClient/URLSessionTransport.swift)
 as the batteries-included default and depends only on Foundation. The adapters below show
 how to layer the paginator over two popular HTTP clients **without making either a
-dependency of this package** — drop the snippet into your own app or a small wrapper
+dependency of this package** - drop the snippet into your own app or a small wrapper
 module that already depends on the client.
 
 ## Two things worth getting right
@@ -79,7 +79,7 @@ struct GetTransport: RESTTransport {
 
 [Alamofire](https://github.com/Alamofire/Alamofire) handles raw `Data` bodies directly, so
 the adapter builds a `URLRequest` and lets Alamofire run it. Crucially, **don't** add
-`.validate()` — we want the real status code back, not a thrown error, so the paginator's
+`.validate()` - we want the real status code back, not a thrown error, so the paginator's
 error mapping can classify it.
 
 ```swift

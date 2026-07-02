@@ -7,8 +7,10 @@ A pluggable, dependency-free Swift paginator for bearer-authenticated REST APIs.
 [![](https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2Fadamtheturtle%2FPaginatedRESTClient%2Fbadge%3Ftype%3Dplatforms)](https://swiftpackageindex.com/adamtheturtle/PaginatedRESTClient)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-`PaginatedRESTClient` turns a paginated, bearer-token REST endpoint into a single call —
-or a stream of growing snapshots — and does the slow, fiddly parts for you: retry with
+[**API documentation**](https://swiftpackageindex.com/adamtheturtle/PaginatedRESTClient/documentation/paginatedrestclient)
+
+`PaginatedRESTClient` turns a paginated, bearer-token REST endpoint into a single call -
+or a stream of growing snapshots - and does the slow, fiddly parts for you: retry with
 backoff, off-main JSON decoding, drift-tolerant error mapping, and **concurrent** page
 fetching that turns a serial chain of round-trips into a few parallel waves. The core
 depends only on Foundation and stays Linux-clean, and the networking backend is pluggable,
@@ -112,7 +114,7 @@ whole list for you, and picks the fastest correct strategy automatically:
   bounded window (8 in flight) rather than walked one blocking round-trip at a time. On a
   large list this is the difference between tens of seconds and a few.
 - **Ordered-prefix streaming.** Pages finish out of order, but each emitted snapshot is a
-  correctly-ordered, contiguous prefix — the stream only grows, and never shows page 3
+  correctly-ordered, contiguous prefix - the stream only grows, and never shows page 3
   before page 2.
 - **`next_page` fallback.** Endpoints that omit `total` (or use cursor-style pagination)
   fall back to walking `next_page` one page at a time, emitting a snapshot per page. A
@@ -130,7 +132,7 @@ To conform a page type, implement `PagedResponse`:
 | --- | --- |
 | `pageItems: [Item]` | The items on this page. |
 | `nextPage: String?` | Absolute URL of the next page, or `nil` at the end. |
-| `total: Int?` | Total count across all pages, when the API reports it — enables the concurrent fast path. |
+| `total: Int?` | Total count across all pages, when the API reports it - enables the concurrent fast path. |
 | `static func identity(of:) -> AnyHashable?` | Stable per-item identity for de-duplication; defaults to `nil` (no de-dup). |
 
 ## Pluggable transports
@@ -143,7 +145,7 @@ public protocol RESTTransport: Sendable {
 }
 ```
 
-A transport executes a `RESTRequest` and returns `(body, HTTP status)` — no decoding, no
+A transport executes a `RESTRequest` and returns `(body, HTTP status)` - no decoding, no
 retry, no auth; all of that stays in the paginator. `URLSessionTransport` is the default
 and depends only on Foundation. To layer the paginator over another HTTP client, pass your
 own transport:

@@ -82,10 +82,10 @@ public struct PaginatedRESTClient {
     nonisolated let transport: any RESTTransport
     /// Builds a configured decoder per call. A factory rather than a shared instance
     /// because decoding runs off the main actor (see `perform`) and `JSONDecoder`
-    /// isn't safe to share across threads — each background decode gets its own.
+    /// isn't safe to share across threads - each background decode gets its own.
     nonisolated let decoderFactory: @Sendable () -> JSONDecoder
     /// Supplies the encoder for request bodies. A closure (not a stored `JSONEncoder`)
-    /// so the paginator stays `Sendable` — its `nonisolated` pagination methods capture
+    /// so the paginator stays `Sendable` - its `nonisolated` pagination methods capture
     /// `self` in child tasks, and `JSONEncoder` isn't `Sendable`. The composing client
     /// owns the body shapes and date strategy, so the encoder is a domain concern.
     nonisolated let encoderFactory: @Sendable () -> JSONEncoder
@@ -151,7 +151,7 @@ public struct PaginatedRESTClient {
     /// callers can render before the whole list is in.
     ///
     /// When the first response reports a `total`, the page count is known up front and the
-    /// remaining pages (numbered `?page=2…N`) are fetched concurrently — turning what was a
+    /// remaining pages (numbered `?page=2…N`) are fetched concurrently - turning what was a
     /// serial chain of round-trips into a few parallel waves. On a large list this is the
     /// difference between tens of seconds and a few. Completed pages are emitted as a
     /// growing contiguous prefix, so each snapshot is correctly ordered even though pages
@@ -166,7 +166,7 @@ public struct PaginatedRESTClient {
         AsyncThrowingStream { continuation in
             // This method and the networking it calls are `nonisolated`, so this
             // unstructured `Task` does not inherit the module's default main-actor
-            // isolation — the pipeline, including the concurrent child tasks below,
+            // isolation - the pipeline, including the concurrent child tasks below,
             // runs on the cooperative pool. That keeps the list-building work (URL
             // construction, snapshot accumulation) off the main thread while pages
             // stream in. (Inheriting the main actor is exactly what a plain `Task`
@@ -278,7 +278,7 @@ public struct PaginatedRESTClient {
                     try await (page, performWithRetry(W.self, request: authorizedGET(url)))
                 }
             }
-            // Keep a bounded window in flight — enough to saturate the network without
+            // Keep a bounded window in flight - enough to saturate the network without
             // unleashing dozens of connections (which invite 429s).
             let maxConcurrent = 8
             var nextToFetch = 2
@@ -322,7 +322,7 @@ public struct PaginatedRESTClient {
             guard let next = page.nextPage, let nextURL = URL(string: next) else { break }
 
             // Safety valve against a server that keeps handing back next_page links.
-            // Surface the cap as an error rather than silently truncating the list —
+            // Surface the cap as an error rather than silently truncating the list -
             // a caller swallowing data without any signal is worse than a failure.
             guard pages < Self.maxSequentialPages else {
                 throw errors.http(status: 0,
@@ -416,7 +416,7 @@ public struct PaginatedRESTClient {
     }
 
     /// Decodes `data` on a background task so the (potentially large) parse doesn't run on
-    /// the main actor. Builds a fresh decoder per call — `JSONDecoder` isn't safe to share
+    /// the main actor. Builds a fresh decoder per call - `JSONDecoder` isn't safe to share
     /// across threads. `DecodingError`s propagate so `perform` can map them as before.
     ///
     /// A structured child task (not `Task.detached`) so it inherits cancellation: when a

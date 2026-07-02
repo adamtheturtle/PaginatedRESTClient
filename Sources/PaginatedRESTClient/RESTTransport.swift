@@ -40,7 +40,7 @@ public nonisolated struct RESTRequest: Sendable {
 /// Executes a `RESTRequest` and returns its raw response body and HTTP status code.
 ///
 /// A transport does exactly that and nothing more: no decoding, no retry, no backoff, no
-/// auth — all of which the paginator owns. Conformers translate `RESTRequest` into their
+/// auth - all of which the paginator owns. Conformers translate `RESTRequest` into their
 /// HTTP client's request type, perform it, and report `(body, statusCode)`. Throwing a
 /// `URLError` lets the paginator route the failure through its error mapping's
 /// `network(_:)` case; any other thrown error propagates and is offered to the mapping's
