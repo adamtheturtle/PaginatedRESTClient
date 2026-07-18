@@ -34,14 +34,30 @@ public protocol PagedResponse: Decodable, Sendable {
     nonisolated var pageItems: [Item] { get }
     nonisolated var nextPage: String? { get }
     nonisolated var total: Int? { get }
+    /// The number of items a *full* page of this endpoint holds - the page size the client
+    /// is asking for, not whatever the first response happened to return.
+    ///
+    /// The page count on the parallel path is `ceil(total / pageSize)`, so this must not be
+    /// smaller than the endpoint's real page size: a first page shortened by server-side
+    /// filtering would otherwise *over*-estimate the page count and make the client request
+    /// pages that do not exist. Over-estimating this value is safe - the page count comes
+    /// out short and `next_page` is walked for the remainder - so the default is a
+    /// deliberately conservative 100, which is a common REST default. Declare the endpoint's
+    /// actual page size to get the full benefit of the parallel path.
+    nonisolated static var pageSize: Int { get }
     /// A stable identity used to de-duplicate items when stitching parallel pages,
     /// so a server that echoes page 1 for an over-requested `page` can't produce
-    /// duplicate rows. `nil` opts out (e.g. items with no stable unique id, which
-    /// take the sequential path anyway).
+    /// duplicate rows. `nil` opts out (e.g. items with no stable unique id), and
+    /// opting out routes the whole list down the sequential `next_page` walk, where
+    /// de-duplication isn't needed because no page is ever requested speculatively.
     nonisolated static func identity(of item: Item) -> AnyHashable?
 }
 
 public extension PagedResponse {
+    nonisolated static var pageSize: Int {
+        100
+    }
+
     nonisolated static func identity(of _: Item) -> AnyHashable? {
         nil
     }
@@ -101,6 +117,17 @@ public struct PaginatedRESTClient {
     /// that keeps handing back links. Hitting it throws rather than truncating.
     nonisolated static let maxSequentialPages = 1000
 
+    /// Upper bound on pages the parallel path will request for one list, mirroring
+    /// `maxSequentialPages`. The page count there is derived from a server-supplied
+    /// `total`, so without a valve a single bogus `total` turns one `fetchAllPages`
+    /// call into thousands of requests. Hitting it throws rather than truncating.
+    nonisolated static let maxParallelPages = 1000
+
+    /// Upper bound on a server-reported `total`, checked before it reaches the page-count
+    /// arithmetic. `total` is decoded straight from JSON, so a hostile or malformed
+    /// response could otherwise overflow `total + pageSize - 1` and trap the process.
+    nonisolated static let maxReportedTotal = 100_000_000
+
     public init(
         apiKey: String,
         baseURL: URL,
@@ -127,7 +154,7 @@ public struct PaginatedRESTClient {
         )
     }
 
-    public func fetch<T: Decodable & Sendable>(_ type: T.Type, path: String) async throws -> T {
+    public nonisolated func fetch<T: Decodable & Sendable>(_ type: T.Type, path: String) async throws -> T {
         guard !apiKey.isEmpty else { throw errors.missingAPIKey() }
 
         return try await performWithRetry(type, request: authorizedGET(baseURL.appending(path: path)))
@@ -135,7 +162,7 @@ public struct PaginatedRESTClient {
 
     /// Accumulates every page of a paginated list endpoint. Convenience over
     /// `streamAllPages` for callers that only want the final, complete list.
-    public func fetchAllPages<W: PagedResponse>(
+    public nonisolated func fetchAllPages<W: PagedResponse>(
         _: W.Type,
         path: String,
         sort: String? = nil
@@ -158,19 +185,24 @@ public struct PaginatedRESTClient {
     /// finish out of order. Endpoints that omit `total` (or any future cursor-style
     /// pagination) fall back to walking `next_page` sequentially, emitting a snapshot per
     /// page. Without this whole mechanism, callers would silently receive only the first page.
-    public func streamAllPages<W: PagedResponse>(
+    public nonisolated func streamAllPages<W: PagedResponse>(
         _: W.Type,
         path: String,
         sort: String? = nil
     ) -> AsyncThrowingStream<[W.Item], Error> {
         AsyncThrowingStream { continuation in
-            // This method and the networking it calls are `nonisolated`, so this
+            // This method is `nonisolated`, and so is the networking it calls, so this
             // unstructured `Task` does not inherit the module's default main-actor
             // isolation - the pipeline, including the concurrent child tasks below,
             // runs on the cooperative pool. That keeps the list-building work (URL
             // construction, snapshot accumulation) off the main thread while pages
-            // stream in. (Inheriting the main actor is exactly what a plain `Task`
-            // would do from a MainActor-isolated context, regardless of Sendability.)
+            // stream in. The `nonisolated` on *this* method is what makes that true:
+            // `AsyncThrowingStream`'s build closure is non-`Sendable` and non-escaping,
+            // so it inherits the enclosing isolation, and a plain `Task` created from a
+            // MainActor-isolated context inherits the main actor regardless of
+            // Sendability. With `NonisolatedNonsendingByDefault` the `nonisolated` async
+            // callees then run on *this* task's executor, so they stay off the main
+            // actor too.
             let work = Task {
                 do {
                     try await drivePagination(W.self, path: path, sort: sort) { continuation.yield($0) }
@@ -180,156 +212,6 @@ public struct PaginatedRESTClient {
                 }
             }
             continuation.onTermination = { _ in work.cancel() }
-        }
-    }
-
-    /// Drives the page-by-page fetch, calling `emit` with each cumulative snapshot.
-    /// Splits into the parallel "fast path" (when `total` is known) and the
-    /// sequential `next_page` walk, both extracted into helpers below.
-    private nonisolated func drivePagination<W: PagedResponse>(
-        _: W.Type,
-        path: String,
-        sort: String?,
-        emit: ([W.Item]) -> Void
-    ) async throws {
-        guard !apiKey.isEmpty else { throw errors.missingAPIKey() }
-
-        let baseQuery: [URLQueryItem] = sort.map { [URLQueryItem(name: "sort", value: $0)] } ?? []
-
-        /// Builds `…/path?sort=…&page=N`. Page numbers are constructed here
-        /// rather than taken from `next_page` so the parallel fetch is
-        /// fully deterministic.
-        func pageURL(_ page: Int?) -> URL? {
-            var comps = URLComponents(url: baseURL.appending(path: path), resolvingAgainstBaseURL: false)
-            var query = baseQuery
-            if let page { query.append(URLQueryItem(name: "page", value: String(page))) }
-            comps?.queryItems = query.isEmpty ? nil : query
-            return comps?.url
-        }
-
-        guard let firstURL = pageURL(nil) else { throw errors.http(status: 0, body: "Invalid URL") }
-
-        let firstPage = try await performWithRetry(W.self, request: authorizedGET(firstURL))
-        // `seen` de-dupes by each item's stable identity across every page, so an
-        // over-requested page that echoes page 1 can't duplicate rows.
-        var seen = Set<AnyHashable>()
-        var items: [W.Item] = []
-        Self.appendNew(firstPage.pageItems, to: &items, seen: &seen, identity: W.identity(of:))
-        emit(items)
-
-        // Fast path: total + page-number URLs let us fetch pages 2…N in parallel.
-        if firstPage.total != nil, !items.isEmpty {
-            let tailNextPage = try await fetchKnownPages(
-                W.self, firstPage: firstPage, items: &items, seen: &seen, pageURL: pageURL, emit: emit
-            )
-            try await walkNextPages(W.self, from: tailNextPage, items: &items, seen: &seen, emit: emit)
-            return
-        }
-
-        // Fallback: follow `next_page` one page at a time.
-        try await walkNextPages(W.self, from: firstPage.nextPage, items: &items, seen: &seen, emit: emit)
-    }
-
-    /// Appends only items not already seen (by their `PagedResponse` identity),
-    /// updating `seen`. Items whose identity is `nil` opt out of de-duplication and
-    /// are always appended.
-    private nonisolated static func appendNew<Item>(
-        _ newItems: [Item],
-        to items: inout [Item],
-        seen: inout Set<AnyHashable>,
-        identity: (Item) -> AnyHashable?
-    ) {
-        for item in newItems {
-            guard let key = identity(item) else { items.append(item); continue }
-
-            if seen.insert(key).inserted { items.append(item) }
-        }
-    }
-
-    /// Fetches pages 2…N concurrently (bounded window), appending each completed page in
-    /// contiguous order and emitting a snapshot whenever the ordered prefix grows. Returns
-    /// the `next_page` of the final estimated page, so the caller can pick up any remainder.
-    private nonisolated func fetchKnownPages<W: PagedResponse>(
-        _: W.Type,
-        firstPage: W,
-        items: inout [W.Item],
-        seen: inout Set<AnyHashable>,
-        pageURL: (Int?) -> URL?,
-        emit: ([W.Item]) -> Void
-    ) async throws -> String? {
-        // `total` is a lower bound on the page count: it can undercount if records are
-        // created mid-load, and the first page can be short. So fetch pages 2…N in
-        // parallel, then follow `next_page` from the final page to pick up any remainder
-        // rather than silently dropping records past the estimate.
-        let pageSize = items.count
-        let total = firstPage.total ?? pageSize
-        let pageCount = max(1, (total + pageSize - 1) / pageSize)
-        guard pageCount > 1 else { return firstPage.nextPage }
-
-        var tailNextPage: String? = firstPage.nextPage
-        var pending: [Int: W] = [:]
-        var nextToEmit = 2
-        var collected = items
-        try await withThrowingTaskGroup(of: (Int, W).self) { group in
-            func enqueue(_ page: Int) throws {
-                guard let url = pageURL(page) else { throw errors.http(status: 0, body: "Invalid URL") }
-
-                group.addTask {
-                    try await (page, performWithRetry(W.self, request: authorizedGET(url)))
-                }
-            }
-            // Keep a bounded window in flight - enough to saturate the network without
-            // unleashing dozens of connections (which invite 429s).
-            let maxConcurrent = 8
-            var nextToFetch = 2
-            while nextToFetch <= pageCount, nextToFetch - 2 < maxConcurrent {
-                try enqueue(nextToFetch); nextToFetch += 1
-            }
-            while let (page, response) = try await group.next() {
-                pending[page] = response
-                // The final page's `next_page` tells us whether the estimate fell short.
-                if page == pageCount { tailNextPage = response.nextPage }
-                // Emit a new snapshot whenever the contiguous prefix grows.
-                var grew = false
-                while let ready = pending.removeValue(forKey: nextToEmit) {
-                    Self.appendNew(ready.pageItems, to: &collected, seen: &seen, identity: W.identity(of:))
-                    nextToEmit += 1; grew = true
-                }
-                if grew { emit(collected) }
-                if nextToFetch <= pageCount { try enqueue(nextToFetch); nextToFetch += 1 }
-            }
-        }
-        items = collected
-        return tailNextPage
-    }
-
-    /// Walks `next_page` links one page at a time, appending and emitting each page.
-    /// Used for the fallback path and to pick up any remainder past a parallel estimate.
-    private nonisolated func walkNextPages<W: PagedResponse>(
-        _: W.Type,
-        from start: String?,
-        items: inout [W.Item],
-        seen: inout Set<AnyHashable>,
-        emit: ([W.Item]) -> Void
-    ) async throws {
-        var url = start.flatMap { URL(string: $0) }
-        var pages = 0
-        while let current = url {
-            let page = try await performWithRetry(W.self, request: authorizedGET(current))
-            Self.appendNew(page.pageItems, to: &items, seen: &seen, identity: W.identity(of:))
-            emit(items)
-            pages += 1
-            guard let next = page.nextPage, let nextURL = URL(string: next) else { break }
-
-            // Safety valve against a server that keeps handing back next_page links.
-            // Surface the cap as an error rather than silently truncating the list -
-            // a caller swallowing data without any signal is worse than a failure.
-            guard pages < Self.maxSequentialPages else {
-                throw errors.http(status: 0,
-                                  body: "Pagination exceeded \(Self.maxSequentialPages) sequential pages")
-            }
-
-            url = nextURL
         }
     }
 
@@ -357,7 +239,7 @@ public struct PaginatedRESTClient {
         }
     }
 
-    public func send<T: Decodable & Sendable>(
+    public nonisolated func send<T: Decodable & Sendable>(
         _ type: T.Type,
         method: String,
         path: String,
@@ -378,7 +260,10 @@ public struct PaginatedRESTClient {
         return try await perform(type, request: request)
     }
 
-    public func perform<T: Decodable & Sendable>(_ type: T.Type, request: RESTRequest) async throws -> T {
+    public nonisolated func perform<T: Decodable & Sendable>(
+        _ type: T.Type,
+        request: RESTRequest
+    ) async throws -> T {
         let data: Data
         let status: Int
         do {
@@ -433,4 +318,209 @@ public struct PaginatedRESTClient {
             return try make().decode(T.self, from: data)
         }.value
     }
+}
+
+// MARK: - Pagination pipeline
+
+/// The multi-page machinery: path selection, ordered stitching, and the two page-walking
+/// strategies. Split into its own extension so the type above stays the client surface
+/// (configuration, single requests, retry) and this stays the pagination algorithm.
+private extension PaginatedRESTClient {
+/// Drives the page-by-page fetch, calling `emit` with each cumulative snapshot.
+/// Splits into the parallel "fast path" (when `total` is known) and the
+/// sequential `next_page` walk, both extracted into helpers below.
+nonisolated func drivePagination<W: PagedResponse>(
+    _: W.Type,
+    path: String,
+    sort: String?,
+    emit: ([W.Item]) -> Void
+) async throws {
+    guard !apiKey.isEmpty else { throw errors.missingAPIKey() }
+
+    let baseQuery: [URLQueryItem] = sort.map { [URLQueryItem(name: "sort", value: $0)] } ?? []
+
+    /// Builds `…/path?sort=…&page=N`. Page numbers are constructed here
+    /// rather than taken from `next_page` so the parallel fetch is
+    /// fully deterministic.
+    func pageURL(_ page: Int?) -> URL? {
+        var comps = URLComponents(url: baseURL.appending(path: path), resolvingAgainstBaseURL: false)
+        var query = baseQuery
+        if let page { query.append(URLQueryItem(name: "page", value: String(page))) }
+        comps?.queryItems = query.isEmpty ? nil : query
+        return comps?.url
+    }
+
+    guard let firstURL = pageURL(nil) else { throw errors.http(status: 0, body: "Invalid URL") }
+
+    let firstPage = try await performWithRetry(W.self, request: authorizedGET(firstURL))
+    // `seen` de-dupes by each item's stable identity across every page, so an
+    // over-requested page that echoes page 1 can't duplicate rows.
+    var seen = Set<AnyHashable>()
+    var items: [W.Item] = []
+    Self.appendNew(firstPage.pageItems, to: &items, seen: &seen, identity: W.identity(of:))
+    emit(items)
+
+    // The parallel path speculatively requests pages by number, so a server that
+    // clamps an out-of-range `page` to a page that exists can echo rows we already
+    // hold. De-duplication by `identity(of:)` is what makes that safe, so a conformer
+    // that returns `nil` for any item (the default implementation returns `nil` for
+    // all of them) is not eligible: it takes the sequential `next_page` walk, which
+    // never requests a page speculatively and so needs no de-duplication. This is the
+    // contract `identity(of:)` documents.
+    let canDeduplicate = firstPage.pageItems.allSatisfy { W.identity(of: $0) != nil }
+
+    // Fast path: total + page-number URLs let us fetch pages 2…N in parallel.
+    if firstPage.total != nil, !items.isEmpty, canDeduplicate {
+        let tailNextPage = try await fetchKnownPages(
+            W.self, firstPage: firstPage, items: &items, seen: &seen, pageURL: pageURL, emit: emit
+        )
+        try await walkNextPages(W.self, from: tailNextPage, items: &items, seen: &seen, emit: emit)
+        return
+    }
+
+    // Fallback: follow `next_page` one page at a time.
+    try await walkNextPages(W.self, from: firstPage.nextPage, items: &items, seen: &seen, emit: emit)
+}
+
+/// Appends only items not already seen (by their `PagedResponse` identity), updating
+/// `seen`, and returns how many were actually appended. Items whose identity is `nil`
+/// opt out of de-duplication and are always appended - only the sequential path, which
+/// never re-requests a page, reaches this with a `nil` identity.
+@discardableResult
+nonisolated static func appendNew<Item>(
+    _ newItems: [Item],
+    to items: inout [Item],
+    seen: inout Set<AnyHashable>,
+    identity: (Item) -> AnyHashable?
+) -> Int {
+    var appended = 0
+    for item in newItems {
+        guard let key = identity(item) else { items.append(item); appended += 1; continue }
+
+        if seen.insert(key).inserted { items.append(item); appended += 1 }
+    }
+    return appended
+}
+
+/// Fetches pages 2…N concurrently (bounded window), appending each completed page in
+/// contiguous order and emitting a snapshot whenever the ordered prefix grows. Returns
+/// the `next_page` of the final estimated page when that page was in range, so the
+/// caller can pick up any remainder, and `nil` when there is nothing left to walk.
+nonisolated func fetchKnownPages<W: PagedResponse>(
+    _: W.Type,
+    firstPage: W,
+    items: inout [W.Item],
+    seen: inout Set<AnyHashable>,
+    pageURL: (Int?) -> URL?,
+    emit: ([W.Item]) -> Void
+) async throws -> String? {
+    // `total` is a lower bound on the page count: it can undercount if records are
+    // created mid-load. So fetch pages 2…N in parallel, then follow `next_page` from
+    // the final page to pick up any remainder rather than silently dropping records
+    // past the estimate.
+    //
+    // The page size is the size the *client asked for* (`W.pageSize`), never the first
+    // response's item count. A first page shortened by server-side filtering would make
+    // the divisor too small and so over-estimate the page count, sending the client
+    // after pages that do not exist - and one 404 on an out-of-range page fails the
+    // whole task group, discarding every record already fetched. Erring the other way
+    // is harmless: a short page count just leaves a remainder for the `next_page` walk.
+    let pageSize = W.pageSize
+    guard pageSize > 0 else {
+        throw errors.decode("page size must be positive, got \(pageSize)")
+    }
+
+    let total = firstPage.total ?? items.count
+    // `total` is decoded straight from JSON, so validate it before it reaches the
+    // page-count arithmetic: `total + pageSize - 1` on `Int.max` traps the process.
+    guard total >= 0, total <= Self.maxReportedTotal else {
+        throw errors.decode("reported total (\(total)) is out of range")
+    }
+
+    let pageCount = max(1, (total + pageSize - 1) / pageSize)
+    // Mirrors `maxSequentialPages`: bound the requests one list can issue, since
+    // `pageCount` is derived from a server-supplied number. Surface the cap as an
+    // error rather than silently truncating, exactly as the sequential walk does.
+    guard pageCount <= Self.maxParallelPages else {
+        throw errors.http(status: 0,
+                          body: "Pagination exceeded \(Self.maxParallelPages) parallel pages")
+    }
+    guard pageCount > 1 else { return firstPage.nextPage }
+
+    // Only the final page's `next_page` is worth following, and only if that page
+    // actually contributed rows. A server that clamps an out-of-range `page` returns
+    // some already-seen page whose `next_page` points back near the start of the list;
+    // following that re-walks everything. No new rows means the page was out of range,
+    // so there is no remainder to pick up.
+    var tailNextPage: String?
+    var pending: [Int: W] = [:]
+    var nextToEmit = 2
+    var collected = items
+    try await withThrowingTaskGroup(of: (Int, W).self) { group in
+        func enqueue(_ page: Int) throws {
+            guard let url = pageURL(page) else { throw errors.http(status: 0, body: "Invalid URL") }
+
+            group.addTask {
+                try await (page, performWithRetry(W.self, request: authorizedGET(url)))
+            }
+        }
+        // Keep a bounded window in flight - enough to saturate the network without
+        // unleashing dozens of connections (which invite 429s).
+        let maxConcurrent = 8
+        var nextToFetch = 2
+        while nextToFetch <= pageCount, nextToFetch - 2 < maxConcurrent {
+            try enqueue(nextToFetch); nextToFetch += 1
+        }
+        while let (page, response) = try await group.next() {
+            pending[page] = response
+            // Emit a new snapshot whenever the contiguous prefix grows.
+            var grew = false
+            while let ready = pending.removeValue(forKey: nextToEmit) {
+                let added = Self.appendNew(
+                    ready.pageItems, to: &collected, seen: &seen, identity: W.identity(of:)
+                )
+                // The final page's `next_page` tells us whether the estimate fell
+                // short - but only when that page was genuinely in range, i.e. it
+                // brought rows we had not already collected.
+                if nextToEmit == pageCount, added > 0 { tailNextPage = ready.nextPage }
+                nextToEmit += 1
+                grew = grew || added > 0
+            }
+            if grew { emit(collected) }
+            if nextToFetch <= pageCount { try enqueue(nextToFetch); nextToFetch += 1 }
+        }
+    }
+    items = collected
+    return tailNextPage
+}
+
+/// Walks `next_page` links one page at a time, appending and emitting each page.
+/// Used for the fallback path and to pick up any remainder past a parallel estimate.
+nonisolated func walkNextPages<W: PagedResponse>(
+    _: W.Type,
+    from start: String?,
+    items: inout [W.Item],
+    seen: inout Set<AnyHashable>,
+    emit: ([W.Item]) -> Void
+) async throws {
+    var url = start.flatMap { URL(string: $0) }
+    var pages = 0
+    while let current = url {
+        let page = try await performWithRetry(W.self, request: authorizedGET(current))
+        Self.appendNew(page.pageItems, to: &items, seen: &seen, identity: W.identity(of:))
+        emit(items)
+        pages += 1
+        guard let next = page.nextPage, let nextURL = URL(string: next) else { break }
+
+        // Safety valve against a server that keeps handing back next_page links.
+        // Surface the cap as an error rather than silently truncating the list -
+        // a caller swallowing data without any signal is worse than a failure.
+        guard pages < Self.maxSequentialPages else {
+            throw errors.http(status: 0,
+                              body: "Pagination exceeded \(Self.maxSequentialPages) sequential pages")
+        }
+
+        url = nextURL
+    }
+}
 }
