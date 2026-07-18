@@ -1,0 +1,23 @@
+# SwiftLint configuration for PaginatedRESTClient.
+# Lints the hand-written sources and tests; the SwiftPM build directory holds
+# generated code (e.g. the test entry point) that we never want to lint.
+
+included:
+  - Sources
+  - Tests
+
+excluded:
+  - .build
+
+disabled_rules:
+  # The package is deliberately a single-file library: the transport, pagination
+  # pipeline, and error types are one cohesive unit, and splitting them across
+  # files to satisfy a line count would obscure that rather than clarify it.
+  - file_length
+
+# `fetchKnownPages` takes six: two `inout` accumulators the caller owns, plus the
+# page-URL and emit callbacks. Bundling them into a parameter object would hide the
+# `inout` aliasing that makes the ordered-prefix emission readable, so allow six.
+function_parameter_count:
+  warning: 6
+  error: 8
