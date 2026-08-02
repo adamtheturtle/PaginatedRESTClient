@@ -5,10 +5,16 @@
 ```swift
 public protocol RESTTransport: Sendable {
     func data(for request: RESTRequest) async throws -> (Data, Int)
+    func response(for request: RESTRequest) async throws -> RESTResponse
 }
 ```
 
-A transport executes a `RESTRequest` and returns the response body and HTTP status code.
+A transport executes a `RESTRequest` and returns the response body, HTTP status code, and
+headers. The paginator uses `Retry-After` to coordinate rate-limit cooldowns across concurrent
+page requests. Existing transports only need `data(for:)`: the protocol supplies a compatible
+`response(for:)` with empty headers, although those transports cannot honor `Retry-After` until
+they implement the header-aware method.
+
 That's the whole contract - **no decoding, no retry, no auth.** All of that stays in the
 paginator, so a transport is a thin translation from `RESTRequest` to whatever your HTTP
 client understands and back.
@@ -19,11 +25,13 @@ how to layer the paginator over two popular HTTP clients **without making either
 dependency of this package** - drop the snippet into your own app or a small wrapper
 module that already depends on the client.
 
-## Two things worth getting right
+## Three things worth getting right
 
-- **Status, don't throw, for non-2xx.** The paginator decides what a 404 or 500 means via
-  your `RESTTransportErrorMapping`. A transport should return `(body, statusCode)` for any
+- **Response, don't throw, for non-2xx.** The paginator decides what a 404 or 500 means via
+  your `RESTTransportErrorMapping`. A transport should return a `RESTResponse` for any
   completed HTTP response and only throw for genuine transport failures (offline, timeout).
+- **Retain headers.** Copy response headers into `RESTResponse.headers` so 429 retries can
+  honor `Retry-After`. Header lookup in `RESTResponse` is case-insensitive.
 - **Rethrow the underlying `URLError`.** The paginator routes a thrown `URLError` through
   your error mapping's `network(_:)` case (and your `isTransient(_:)` decides whether to
   retry). Clients that wrap transport errors in their own type should unwrap back to
@@ -45,6 +53,11 @@ struct GetTransport: RESTTransport {
     let client: APIClient
 
     func data(for request: RESTRequest) async throws -> (Data, Int) {
+        let response = try await response(for: request)
+        return (response.data, response.statusCode)
+    }
+
+    func response(for request: RESTRequest) async throws -> RESTResponse {
         var get = Request<Data>(
             url: request.url,
             method: HTTPMethod(rawValue: request.method)
@@ -57,8 +70,16 @@ struct GetTransport: RESTTransport {
 
         do {
             let response = try await client.data(for: get)
-            let status = (response.response as? HTTPURLResponse)?.statusCode ?? 0
-            return (response.data, status)
+            let http = response.response as? HTTPURLResponse
+            let headers = http?.allHeaderFields.reduce(into: [String: String]()) { result, field in
+                let name = (field.key as? String) ?? String(describing: field.key)
+                result[name] = String(describing: field.value)
+            } ?? [:]
+            return RESTResponse(
+                data: response.data,
+                statusCode: http?.statusCode ?? 0,
+                headers: headers
+            )
         } catch let urlError as URLError {
             // Surface the underlying URLError so the paginator's network mapping applies.
             throw urlError
@@ -92,6 +113,11 @@ struct AlamofireTransport: RESTTransport {
     let session: Session
 
     func data(for request: RESTRequest) async throws -> (Data, Int) {
+        let response = try await response(for: request)
+        return (response.data, response.statusCode)
+    }
+
+    func response(for request: RESTRequest) async throws -> RESTResponse {
         var urlRequest = URLRequest(url: request.url)
         urlRequest.httpMethod = request.method
         for (field, value) in request.headers {
@@ -105,7 +131,16 @@ struct AlamofireTransport: RESTTransport {
 
         switch response.result {
         case let .success(data):
-            return (data, response.response?.statusCode ?? 0)
+            let headers = response.response?.allHeaderFields.reduce(into: [String: String]()) {
+                result, field in
+                let name = (field.key as? String) ?? String(describing: field.key)
+                result[name] = String(describing: field.value)
+            } ?? [:]
+            return RESTResponse(
+                data: data,
+                statusCode: response.response?.statusCode ?? 0,
+                headers: headers
+            )
         case let .failure(afError):
             // Rethrow the underlying URLError so the paginator's network mapping applies.
             if case let .sessionTaskFailed(error as URLError) = afError {
@@ -122,4 +157,5 @@ struct AlamofireTransport: RESTTransport {
 ```
 
 For any other stack (an in-house client, gRPC-Web gateway, a record/replay fixture for
-tests) the recipe is the same: translate `RESTRequest`, perform it, return `(Data, Int)`.
+tests) the recipe is the same: translate `RESTRequest`, perform it, and return a
+`RESTResponse` that retains the status and headers.

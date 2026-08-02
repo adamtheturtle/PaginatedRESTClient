@@ -204,14 +204,155 @@ private struct StubTransport: RESTTransport {
     }
 }
 
-private func makeClient(transport: any RESTTransport = StubTransport()) -> PaginatedRESTClient {
+/// A wall clock that tests can advance without waiting in real time.
+private nonisolated final class TestClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var date: Date
+
+    init(_ date: Date = Date(timeIntervalSince1970: 0)) {
+        self.date = date
+    }
+
+    var now: Date {
+        lock.withLock { date }
+    }
+
+    func advance(by interval: TimeInterval) {
+        lock.withLock { date.addTimeInterval(interval) }
+    }
+}
+
+/// Suspends every caller until the test advances the shared clock and releases them.
+private nonisolated final class ControlledSleeper: @unchecked Sendable {
+    private let lock = NSLock()
+    private var delays: [TimeInterval] = []
+    private var continuations: [CheckedContinuation<Void, any Error>] = []
+
+    func sleep(for delay: TimeInterval) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            lock.withLock {
+                delays.append(delay)
+                continuations.append(continuation)
+            }
+        }
+    }
+
+    var requestedDelays: [TimeInterval] {
+        lock.withLock { delays }
+    }
+
+    func resumeAll() {
+        let waiting = lock.withLock {
+            let result = continuations
+            continuations.removeAll()
+            return result
+        }
+        waiting.forEach { $0.resume() }
+    }
+}
+
+/// Returns one rate limit response followed by a success, retaining mixed-case headers
+/// to exercise the header-aware transport path and case-insensitive lookup together.
+private nonisolated final class RetryOnceTransport: RESTTransport, @unchecked Sendable {
+    private let lock = NSLock()
+    private var attempts = 0
+    let retryAfter: String?
+
+    init(retryAfter: String?) {
+        self.retryAfter = retryAfter
+    }
+
+    func data(for request: RESTRequest) async throws -> (Data, Int) {
+        let response = try await response(for: request)
+        return (response.data, response.statusCode)
+    }
+
+    func response(for _: RESTRequest) async throws -> RESTResponse {
+        let attempt = lock.withLock {
+            attempts += 1
+            return attempts
+        }
+        if attempt == 1 {
+            return RESTResponse(
+                data: Data("limited".utf8),
+                statusCode: 429,
+                headers: retryAfter.map { ["rEtRy-AfTeR": $0] } ?? [:]
+            )
+        }
+        return RESTResponse(data: Data(#"{"id":1}"#.utf8), statusCode: 200)
+    }
+
+    var requestCount: Int {
+        lock.withLock { attempts }
+    }
+}
+
+/// Makes pages 2 and 3 reach their first 429 together, then serves both successfully.
+/// The barrier prevents scheduler order from weakening the shared-cooldown assertion.
+private nonisolated final class ConcurrentRateLimitTransport: RESTTransport, @unchecked Sendable {
+    private let lock = NSLock()
+    private var attempts: [Int: Int] = [:]
+    private var rateLimited: [CheckedContinuation<RESTResponse, Never>] = []
+
+    func data(for request: RESTRequest) async throws -> (Data, Int) {
+        let response = try await response(for: request)
+        return (response.data, response.statusCode)
+    }
+
+    func response(for request: RESTRequest) async throws -> RESTResponse {
+        let page = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?
+            .queryItems?.first { $0.name == "page" }?.value.flatMap(Int.init) ?? 1
+        let attempt = lock.withLock {
+            attempts[page, default: 0] += 1
+            return attempts[page]!
+        }
+
+        if page > 1, attempt == 1 {
+            return await withCheckedContinuation { continuation in
+                let waiting = lock.withLock {
+                    rateLimited.append(continuation)
+                    guard rateLimited.count == 2 else { return [CheckedContinuation<RESTResponse, Never>]() }
+                    let result = rateLimited
+                    rateLimited.removeAll()
+                    return result
+                }
+                let response = RESTResponse(
+                    data: Data("limited".utf8),
+                    statusCode: 429,
+                    headers: ["Retry-After": "10"]
+                )
+                waiting.forEach { $0.resume(returning: response) }
+            }
+        }
+
+        let ids = switch page {
+        case 1: [1, 2]
+        case 2: [3, 4]
+        default: [5, 6]
+        }
+        let things = ids.map { #"{"id":\#($0)}"# }.joined(separator: ",")
+        let next = page < 3 ? #""https://example.test/things/?page=\#(page + 1)""# : "null"
+        let json = #"{"things":[\#(things)],"next_page":\#(next),"total":6}"#
+        return RESTResponse(data: Data(json.utf8), statusCode: 200)
+    }
+
+    func requestCount(for page: Int) -> Int {
+        lock.withLock { attempts[page, default: 0] }
+    }
+}
+
+private func makeClient(
+    transport: any RESTTransport = StubTransport(),
+    retryRuntime: RetryRuntime = .live
+) -> PaginatedRESTClient {
     PaginatedRESTClient(
         apiKey: "test-key",
         baseURL: URL(string: "https://example.test")!,
         transport: transport,
         decoderFactory: { JSONDecoder() },
         encoderFactory: { JSONEncoder() },
-        errors: TestErrors()
+        errors: TestErrors(),
+        retryRuntime: retryRuntime
     )
 }
 
@@ -270,6 +411,137 @@ struct PaginatedRESTClientTests {
             _ = try await makeClient(transport: FailingTransport())
                 .fetch(Thing.self, path: "/things/1")
         }
+    }
+}
+
+@Suite("Rate-limit retry policy")
+struct RateLimitRetryTests {
+    @Test
+    func `retry-after parses delta seconds and HTTP dates`() throws {
+        var components = DateComponents()
+        components.calendar = Calendar(identifier: .gregorian)
+        components.timeZone = TimeZone(secondsFromGMT: 0)
+        components.year = 1994
+        components.month = 11
+        components.day = 6
+        components.hour = 8
+        components.minute = 49
+        components.second = 7
+        let now = try #require(components.date)
+
+        #expect(PaginatedRESTClient.retryAfterDelay(" 120 ", relativeTo: now) == 120)
+        #expect(PaginatedRESTClient.retryAfterDelay(
+            "Sun, 06 Nov 1994 08:49:37 GMT", relativeTo: now
+        ) == 30)
+        #expect(PaginatedRESTClient.retryAfterDelay(
+            "Sunday, 06-Nov-94 08:49:37 GMT", relativeTo: now
+        ) == 30)
+        #expect(PaginatedRESTClient.retryAfterDelay(
+            "Sun Nov  6 08:49:37 1994", relativeTo: now
+        ) == 30)
+        #expect(PaginatedRESTClient.retryAfterDelay("not a date", relativeTo: now) == nil)
+        #expect(PaginatedRESTClient.retryAfterDelay("-1", relativeTo: now) == nil)
+        #expect(PaginatedRESTClient.retryAfterDelay(String(repeating: "9", count: 400), relativeTo: now) == nil)
+    }
+
+    @Test
+    func `fallback delay is exponential jittered and capped`() {
+        #expect(PaginatedRESTClient.rateLimitFallbackDelay(retryNumber: 1, jitter: 0) == 1)
+        #expect(PaginatedRESTClient.rateLimitFallbackDelay(retryNumber: 1, jitter: 1) == 1.25)
+        #expect(PaginatedRESTClient.rateLimitFallbackDelay(retryNumber: 2, jitter: 0.5) == 2.25)
+        #expect(PaginatedRESTClient.rateLimitFallbackDelay(retryNumber: 20, jitter: 1) == 60)
+    }
+
+    @Test
+    func `a delta Retry-After header controls the retry delay`() async throws {
+        let clock = TestClock()
+        let sleeper = ControlledSleeper()
+        let transport = RetryOnceTransport(retryAfter: "7")
+        let client = makeClient(
+            transport: transport,
+            retryRuntime: RetryRuntime(
+                now: { clock.now },
+                sleep: { try await sleeper.sleep(for: $0) },
+                jitter: { 0 }
+            )
+        )
+        let request = client.authorizedGET(try #require(URL(string: "https://example.test/things/1")))
+        let task = Task { try await client.performWithRetry(Thing.self, request: request) }
+
+        while sleeper.requestedDelays.isEmpty { await Task.yield() }
+        #expect(sleeper.requestedDelays == [7])
+        #expect(transport.requestCount == 1)
+        clock.advance(by: 7)
+        sleeper.resumeAll()
+
+        #expect(try await task.value == Thing(id: 1))
+        #expect(transport.requestCount == 2)
+    }
+
+    @Test
+    func `an invalid Retry-After header selects the jittered fallback`() async throws {
+        let clock = TestClock()
+        let sleeper = ControlledSleeper()
+        let transport = RetryOnceTransport(retryAfter: "later")
+        let client = makeClient(
+            transport: transport,
+            retryRuntime: RetryRuntime(
+                now: { clock.now },
+                sleep: { try await sleeper.sleep(for: $0) },
+                jitter: { 0.5 }
+            )
+        )
+        let request = client.authorizedGET(try #require(URL(string: "https://example.test/things/1")))
+        let task = Task { try await client.performWithRetry(Thing.self, request: request) }
+
+        while sleeper.requestedDelays.isEmpty { await Task.yield() }
+        #expect(sleeper.requestedDelays == [1.125])
+        clock.advance(by: 1.125)
+        sleeper.resumeAll()
+
+        #expect(try await task.value == Thing(id: 1))
+        #expect(transport.requestCount == 2)
+    }
+
+    @Test
+    func `cancellation interrupts a Retry-After wait without another request`() async throws {
+        let transport = RetryOnceTransport(retryAfter: "3600")
+        let client = makeClient(transport: transport)
+        let request = client.authorizedGET(try #require(URL(string: "https://example.test/things/1")))
+        let task = Task { try await client.performWithRetry(Thing.self, request: request) }
+
+        while transport.requestCount == 0 { await Task.yield() }
+        task.cancel()
+
+        await #expect(throws: CancellationError.self) { try await task.value }
+        #expect(transport.requestCount == 1)
+    }
+
+    @Test
+    func `concurrent pagination retries share one cooldown deadline`() async throws {
+        let clock = TestClock()
+        let sleeper = ControlledSleeper()
+        let transport = ConcurrentRateLimitTransport()
+        let client = makeClient(
+            transport: transport,
+            retryRuntime: RetryRuntime(
+                now: { clock.now },
+                sleep: { try await sleeper.sleep(for: $0) },
+                jitter: { 0 }
+            )
+        )
+        let task = Task { try await client.fetchAllPages(ThingsPage.self, path: "/things/") }
+
+        while sleeper.requestedDelays.count < 2 { await Task.yield() }
+        #expect(sleeper.requestedDelays == [10, 10])
+        #expect(transport.requestCount(for: 2) == 1)
+        #expect(transport.requestCount(for: 3) == 1)
+
+        clock.advance(by: 10)
+        sleeper.resumeAll()
+        #expect(try await task.value == things(1 ... 6))
+        #expect(transport.requestCount(for: 2) == 2)
+        #expect(transport.requestCount(for: 3) == 2)
     }
 }
 

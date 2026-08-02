@@ -15,8 +15,8 @@ Add the `PaginatedRESTClient` product to your target dependencies.
 
 ## Product
 
-- `PaginatedRESTClient`: Fetch, stream, retry, decode, and de-duplicate paginated REST
-  endpoints through a pluggable transport.
+- `PaginatedRESTClient`: Fetch, stream, retry with shared rate-limit-aware backoff, decode,
+  and de-duplicate paginated REST endpoints through a pluggable transport.
 
 ## Requirements
 
