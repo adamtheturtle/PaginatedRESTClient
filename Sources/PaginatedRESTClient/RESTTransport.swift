@@ -4,7 +4,7 @@
 //
 //  The pluggable networking seam. `PaginatedRESTClient` does request building, retry,
 //  off-main decoding, error mapping, and concurrent pagination; the only thing it hands
-//  out is "execute these bytes, give me back the response bytes and status". That single
+//  out is "execute these bytes, give me back the response bytes, status, and headers". That single
 //  responsibility is `RESTTransport`, so the paginator can sit over any HTTP stack
 //  (URLSession, Get, Alamofire, a test stub) without depending on any of them.
 //
@@ -37,11 +37,31 @@ public nonisolated struct RESTRequest: Sendable {
     }
 }
 
-/// Executes a `RESTRequest` and returns its raw response body and HTTP status code.
+/// The raw result of one HTTP request. Header names are matched case-insensitively by
+/// ``value(forHTTPHeaderField:)`` because HTTP field names are case-insensitive.
+public nonisolated struct RESTResponse: Sendable {
+    public var data: Data
+    public var statusCode: Int
+    public var headers: [String: String]
+
+    public init(data: Data, statusCode: Int, headers: [String: String] = [:]) {
+        self.data = data
+        self.statusCode = statusCode
+        self.headers = headers
+    }
+
+    /// Returns a response header without requiring callers or transports to agree on
+    /// capitalization (for example, `Retry-After` versus `retry-after`).
+    public func value(forHTTPHeaderField field: String) -> String? {
+        headers.first { $0.key.compare(field, options: .caseInsensitive) == .orderedSame }?.value
+    }
+}
+
+/// Executes a `RESTRequest` and returns its raw response body, HTTP status, and headers.
 ///
 /// A transport does exactly that and nothing more: no decoding, no retry, no backoff, no
 /// auth - all of which the paginator owns. Conformers translate `RESTRequest` into their
-/// HTTP client's request type, perform it, and report `(body, statusCode)`. Throwing a
+/// HTTP client's request type, perform it, and report the resulting ``RESTResponse``. Throwing a
 /// `URLError` lets the paginator route the failure through its error mapping's
 /// `network(_:)` case; any other thrown error propagates and is offered to the mapping's
 /// `isTransient(_:)` for the retry decision.
@@ -52,4 +72,16 @@ public protocol RESTTransport: Sendable {
     /// the off-main pagination pipeline rather than pinning it to the module's default
     /// MainActor isolation.
     nonisolated func data(for request: RESTRequest) async throws -> (Data, Int)
+
+    /// Execute a request while retaining response headers. Existing transports that only
+    /// implement ``data(for:)`` inherit a compatibility implementation with empty headers;
+    /// transports should implement this requirement when retry policy needs response metadata.
+    nonisolated func response(for request: RESTRequest) async throws -> RESTResponse
+}
+
+public extension RESTTransport {
+    nonisolated func response(for request: RESTRequest) async throws -> RESTResponse {
+        let (data, statusCode) = try await data(for: request)
+        return RESTResponse(data: data, statusCode: statusCode)
+    }
 }

@@ -25,13 +25,22 @@ public struct URLSessionTransport: RESTTransport {
     }
 
     public nonisolated func data(for request: RESTRequest) async throws -> (Data, Int) {
+        let response = try await response(for: request)
+        return (response.data, response.statusCode)
+    }
+
+    public nonisolated func response(for request: RESTRequest) async throws -> RESTResponse {
         let (data, response) = try await session.data(for: Self.urlRequest(from: request))
         guard let http = response as? HTTPURLResponse else {
             // A non-HTTP response is a transport-level anomaly; surface it as a URLError
             // so the paginator routes it through the error mapping's `network(_:)` case.
             throw URLError(.badServerResponse)
         }
-        return (data, http.statusCode)
+        let headers = http.allHeaderFields.reduce(into: [String: String]()) { result, field in
+            let name = (field.key as? String) ?? String(describing: field.key)
+            result[name] = String(describing: field.value)
+        }
+        return RESTResponse(data: data, statusCode: http.statusCode, headers: headers)
     }
 
     /// Translates the backend-neutral `RESTRequest` into a `URLRequest`.

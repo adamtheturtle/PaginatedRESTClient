@@ -83,6 +83,50 @@ public protocol RESTTransportErrorMapping: Sendable {
     nonisolated func isTransient(_ error: Error) -> Bool
 }
 
+// MARK: - Retry coordination
+
+/// Injectable sources used by retry tests. Production clients use wall-clock time,
+/// cancellable `Task.sleep`, and system randomness.
+nonisolated struct RetryRuntime: Sendable {
+    let now: @Sendable () -> Date
+    let sleep: @Sendable (TimeInterval) async throws -> Void
+    let jitter: @Sendable () -> Double
+
+    static let live = RetryRuntime(
+        now: Date.init,
+        sleep: { delay in try await Task.sleep(for: .seconds(delay)) },
+        jitter: { Double.random(in: 0 ... 1) }
+    )
+}
+
+/// A client-wide rate-limit deadline. A lock keeps the fast preflight check synchronous
+/// while allowing every concurrent pagination task to publish and observe one cooldown.
+private nonisolated final class RateLimitCooldown: @unchecked Sendable {
+    private let lock = NSLock()
+    private var deadline: Date?
+
+    func extend(until candidate: Date) {
+        lock.withLock {
+            if deadline.map({ candidate > $0 }) ?? true { deadline = candidate }
+        }
+    }
+
+    func remaining(at now: Date) -> TimeInterval? {
+        lock.withLock {
+            guard let deadline else { return nil }
+            let delay = deadline.timeIntervalSince(now)
+            return delay > 0 ? delay : nil
+        }
+    }
+}
+
+/// Keeps the mapped client error private while retaining the HTTP response for retry
+/// decisions. Public `perform` unwraps this before returning an error to its caller.
+private nonisolated struct HTTPAttemptFailure: Error {
+    let response: RESTResponse
+    let mappedError: any Error
+}
+
 // MARK: - Client
 
 /// The reusable paginator. Carries only immutable, Sendable configuration and drives
@@ -112,6 +156,8 @@ public struct PaginatedRESTClient {
     /// logging subsystem and stays Foundation-only; defaults to a no-op. Bridge it to
     /// `os.Logger`, `print`, or any sink at the call site.
     nonisolated let log: @Sendable (String) -> Void
+    private nonisolated let retryRuntime: RetryRuntime
+    private nonisolated let rateLimitCooldown: RateLimitCooldown
 
     /// Upper bound on `next_page` follows for one list, guarding against a server
     /// that keeps handing back links. Hitting it throws rather than truncating.
@@ -137,6 +183,28 @@ public struct PaginatedRESTClient {
         errors: any RESTTransportErrorMapping,
         log: @escaping @Sendable (String) -> Void = { _ in }
     ) {
+        self.init(
+            apiKey: apiKey,
+            baseURL: baseURL,
+            transport: transport,
+            decoderFactory: decoderFactory,
+            encoderFactory: encoderFactory,
+            errors: errors,
+            log: log,
+            retryRuntime: .live
+        )
+    }
+
+    init(
+        apiKey: String,
+        baseURL: URL,
+        transport: any RESTTransport,
+        decoderFactory: @escaping @Sendable () -> JSONDecoder,
+        encoderFactory: @escaping @Sendable () -> JSONEncoder,
+        errors: any RESTTransportErrorMapping,
+        log: @escaping @Sendable (String) -> Void = { _ in },
+        retryRuntime: RetryRuntime
+    ) {
         self.apiKey = apiKey
         self.baseURL = baseURL
         self.transport = transport
@@ -144,6 +212,8 @@ public struct PaginatedRESTClient {
         self.encoderFactory = encoderFactory
         self.errors = errors
         self.log = log
+        self.retryRuntime = retryRuntime
+        rateLimitCooldown = RateLimitCooldown()
     }
 
     public nonisolated func authorizedGET(_ url: URL) -> RESTRequest {
@@ -226,15 +296,44 @@ public struct PaginatedRESTClient {
         var attempt = 0
         while true {
             do {
-                return try await perform(type, request: request)
+                return try await performAttempt(type, request: request)
+            } catch let failure as HTTPAttemptFailure {
+                attempt += 1
+
+                if failure.response.statusCode == 429 {
+                    let now = retryRuntime.now()
+                    let retryAfter = Self.retryAfterDelay(
+                        failure.response.value(forHTTPHeaderField: "Retry-After"),
+                        relativeTo: now
+                    )
+                    let delay = retryAfter ?? Self.rateLimitFallbackDelay(
+                        retryNumber: attempt,
+                        jitter: retryRuntime.jitter()
+                    )
+                    rateLimitCooldown.extend(until: now.addingTimeInterval(delay))
+
+                    guard attempt < maxAttempts, errors.isTransient(failure.mappedError) else {
+                        throw failure.mappedError
+                    }
+                    log("Rate limited on \(request.url.path); retry \(attempt)/\(maxAttempts - 1) "
+                        + "after shared \(String(format: "%.3f", delay))s cooldown")
+                    try await waitForRateLimitCooldown()
+                    continue
+                }
+
+                guard attempt < maxAttempts, errors.isTransient(failure.mappedError) else {
+                    throw failure.mappedError
+                }
+                log("Transient failure on \(request.url.path); retry \(attempt)/\(maxAttempts - 1)")
+                try await retryRuntime.sleep(0.3 * pow(2, Double(attempt - 1)))
             } catch {
                 attempt += 1
                 guard attempt < maxAttempts, errors.isTransient(error) else { throw error }
 
                 log("Transient failure on \(request.url.path); retry \(attempt)/\(maxAttempts - 1)")
-                // 300ms, then 600ms. Let cancellation propagate so a torn-down
-                // stream stops here rather than issuing another request.
-                try await Task.sleep(for: .milliseconds(300 * (1 << (attempt - 1))))
+                // Preserve the existing 300ms, then 600ms exponential policy for
+                // non-HTTP transient errors. The injected sleep remains cancellable.
+                try await retryRuntime.sleep(0.3 * pow(2, Double(attempt - 1)))
             }
         }
     }
@@ -264,25 +363,41 @@ public struct PaginatedRESTClient {
         _ type: T.Type,
         request: RESTRequest
     ) async throws -> T {
-        let data: Data
-        let status: Int
         do {
-            (data, status) = try await transport.data(for: request)
+            return try await performAttempt(type, request: request)
+        } catch let failure as HTTPAttemptFailure {
+            throw failure.mappedError
+        }
+    }
+
+    private nonisolated func performAttempt<T: Decodable & Sendable>(
+        _ type: T.Type,
+        request: RESTRequest
+    ) async throws -> T {
+        try await waitForRateLimitCooldown()
+
+        let response: RESTResponse
+        do {
+            response = try await transport.response(for: request)
         } catch let urlError as URLError {
+            try Task.checkCancellation()
             // Surface transport failures (offline, timeout, unreachable) as a typed,
             // friendly error rather than leaking the raw URLError into the UI.
             throw errors.network(urlError)
         }
-        guard (200 ..< 300).contains(status) else {
-            let body = String(data: data, encoding: .utf8) ?? ""
-            throw errors.http(status: status, body: body)
+        guard (200 ..< 300).contains(response.statusCode) else {
+            let body = String(data: response.data, encoding: .utf8) ?? ""
+            throw HTTPAttemptFailure(
+                response: response,
+                mappedError: errors.http(status: response.statusCode, body: body)
+            )
         }
 
         do {
             // Decode off the main actor: the client may be MainActor-isolated, so on a large
             // list (many pages × nested objects) decoding here would hitch the UI.
             // `Data` and `T` are Sendable, so the work crosses the boundary cleanly.
-            return try await decodeInBackground(T.self, from: data)
+            return try await decodeInBackground(T.self, from: response.data)
         } catch let DecodingError.keyNotFound(key, ctx) {
             throw errors.decode("missing key '\(key.stringValue)' at \(pathString(ctx.codingPath))")
         } catch let DecodingError.valueNotFound(type, ctx) {
@@ -294,6 +409,53 @@ public struct PaginatedRESTClient {
         } catch let DecodingError.dataCorrupted(ctx) {
             throw errors.decode("corrupted at \(pathString(ctx.codingPath)): \(ctx.debugDescription)")
         }
+    }
+
+    /// Waits against the latest shared deadline. The loop matters when a sibling receives
+    /// a later `Retry-After` while this task is already sleeping.
+    private nonisolated func waitForRateLimitCooldown() async throws {
+        while let delay = rateLimitCooldown.remaining(at: retryRuntime.now()) {
+            try Task.checkCancellation()
+            try await retryRuntime.sleep(delay)
+        }
+    }
+
+    /// Parses RFC delay-seconds and all three HTTP-date forms. A date in the past is a
+    /// valid instruction to retry immediately; malformed and negative values fall back.
+    nonisolated static func retryAfterDelay(_ value: String?, relativeTo now: Date) -> TimeInterval? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty, trimmed.allSatisfy(\.isASCII),
+           trimmed.allSatisfy(\.isNumber), let seconds = TimeInterval(trimmed), seconds.isFinite {
+            return seconds
+        }
+
+        let formats = [
+            "EEE',' dd MMM yyyy HH':'mm':'ss zzz",
+            "EEEE',' dd-MMM-yy HH':'mm':'ss zzz",
+            "EEE MMM d HH':'mm':'ss yyyy"
+        ]
+        for format in formats {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.calendar = Calendar(identifier: .gregorian)
+            formatter.timeZone = TimeZone(secondsFromGMT: 0)
+            formatter.dateFormat = format
+            formatter.isLenient = false
+            if let date = formatter.date(from: trimmed) {
+                return max(0, date.timeIntervalSince(now))
+            }
+        }
+        return nil
+    }
+
+    /// Positive jitter above a conservative one-second exponential base, capped at
+    /// one minute. `jitter` is clamped so a custom random source cannot violate the cap.
+    nonisolated static func rateLimitFallbackDelay(retryNumber: Int, jitter: Double) -> TimeInterval {
+        let exponent = Double(min(max(retryNumber - 1, 0), 10))
+        let base = min(60, pow(2, exponent))
+        let factor = 1 + (0.25 * min(max(jitter, 0), 1))
+        return min(60, base * factor)
     }
 
     private nonisolated func pathString(_ keys: [CodingKey]) -> String {
