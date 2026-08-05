@@ -691,14 +691,16 @@ nonisolated func walkNextPages<W: PagedResponse>(
     seen: inout Set<AnyHashable>,
     emit: ([W.Item]) -> Void
 ) async throws {
-    var url = start.flatMap { URL(string: $0) }
+    var url = try start.flatMap { try validatedNextPageURL($0) }
     var pages = 0
     while let current = url {
         let page = try await performWithRetry(W.self, request: authorizedGET(current))
         Self.appendNew(page.pageItems, to: &items, seen: &seen, identity: W.identity(of:))
         emit(items)
         pages += 1
-        guard let next = page.nextPage, let nextURL = URL(string: next) else { break }
+        guard let next = page.nextPage,
+              let nextURL = try validatedNextPageURL(next)
+        else { break }
 
         // Safety valve against a server that keeps handing back next_page links.
         // Surface the cap as an error rather than silently truncating the list -
@@ -709,6 +711,41 @@ nonisolated func walkNextPages<W: PagedResponse>(
         }
 
         url = nextURL
+    }
+}
+
+/// Resolves a response-provided pagination link without granting it authority to choose
+/// where the bearer credential is sent. Relative links are supported, while every
+/// absolute result must remain on the configured HTTP(S) origin.
+nonisolated func validatedNextPageURL(_ value: String) throws -> URL? {
+    guard !value.isEmpty,
+          let resolved = URL(string: value, relativeTo: baseURL)?.absoluteURL
+    else { return nil }
+
+    guard let base = URLComponents(url: baseURL, resolvingAgainstBaseURL: false),
+          let candidate = URLComponents(url: resolved, resolvingAgainstBaseURL: false),
+          let baseScheme = base.scheme?.lowercased(),
+          let candidateScheme = candidate.scheme?.lowercased(),
+          ["http", "https"].contains(baseScheme),
+          candidateScheme == baseScheme,
+          let baseHost = base.host?.lowercased(),
+          candidate.host?.lowercased() == baseHost,
+          effectivePort(candidate) == effectivePort(base),
+          candidate.user == nil,
+          candidate.password == nil
+    else {
+        throw errors.http(status: 0, body: "Pagination next_page left the configured origin")
+    }
+
+    return resolved
+}
+
+nonisolated func effectivePort(_ components: URLComponents) -> Int? {
+    if let port = components.port { return port }
+    return switch components.scheme?.lowercased() {
+    case "http": 80
+    case "https": 443
+    default: nil
     }
 }
 }
