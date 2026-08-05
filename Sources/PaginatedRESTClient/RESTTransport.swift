@@ -28,13 +28,34 @@ public nonisolated struct RESTRequest: Sendable {
     public var headers: [String: String]
     /// The request body, already encoded, or `nil` for bodyless requests like GET.
     public var body: Data?
+    /// A local file to stream as the request body without first loading it into
+    /// ``body``. The caller must keep the file in place until the request completes.
+    /// Supplying both body sources is rejected by ``URLSessionTransport``.
+    public var bodyFileURL: URL?
 
-    public init(url: URL, method: String, headers: [String: String] = [:], body: Data? = nil) {
+    public init(
+        url: URL,
+        method: String,
+        headers: [String: String] = [:],
+        body: Data? = nil,
+        bodyFileURL: URL? = nil
+    ) {
         self.url = url
         self.method = method
         self.headers = headers
         self.body = body
+        self.bodyFileURL = bodyFileURL
     }
+}
+
+/// A request selected an invalid source for its HTTP body.
+public nonisolated enum RESTRequestBodyError: Error, Equatable, Sendable {
+    /// An in-memory body and a file-backed body were both supplied.
+    case multipleSources
+    /// File-backed bodies must use a local `file:` URL.
+    case bodyFileMustBeFileURL(URL)
+    /// The local body file did not exist or was not readable before the request began.
+    case unreadableBodyFile(URL)
 }
 
 /// The raw result of one HTTP request. Header names are matched case-insensitively by

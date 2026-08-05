@@ -1,5 +1,6 @@
 import PaginatedRESTClient
 import Foundation
+import Synchronization
 import Testing
 
 #if canImport(FoundationNetworking)
@@ -8,6 +9,47 @@ import Testing
 
 @Suite("URLSession transport response limits")
 struct URLSessionTransportTests {
+    @Test
+    func `a file-backed request body is delivered through a stream`() async throws {
+        let body = Data(repeating: 0xA5, count: 2 * 1024 * 1024)
+        let bodyFileURL = FileManager.default.temporaryDirectory
+            .appending(path: "PaginatedRESTClient-\(UUID().uuidString).body")
+        try body.write(to: bodyFileURL)
+        defer { try? FileManager.default.removeItem(at: bodyFileURL) }
+
+        FileBodyURLProtocol.reset()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [FileBodyURLProtocol.self]
+        let transport = URLSessionTransport(session: URLSession(configuration: configuration))
+        let request = RESTRequest(
+            url: URL(string: "https://example.test/upload")!,
+            method: "POST",
+            headers: ["Content-Length": String(body.count)],
+            bodyFileURL: bodyFileURL
+        )
+
+        let response = try await transport.response(for: request)
+
+        #expect(response.statusCode == 200)
+        #expect(request.body == nil)
+        #expect(FileBodyURLProtocol.receivedThroughStream())
+        #expect(FileBodyURLProtocol.receivedBody() == body)
+    }
+
+    @Test
+    func `multiple request body sources are rejected before transport`() async {
+        let request = RESTRequest(
+            url: URL(string: "https://example.test/upload")!,
+            method: "POST",
+            body: Data([1]),
+            bodyFileURL: FileManager.default.temporaryDirectory.appending(path: "body")
+        )
+
+        await #expect(throws: RESTRequestBodyError.multipleSources) {
+            _ = try await URLSessionTransport().response(for: request)
+        }
+    }
+
     @Test(arguments: [(200, 8, 64), (500, 64, 8)])
     func `success and error bodies use separate streaming limits`(
         status: Int,
@@ -75,6 +117,71 @@ struct URLSessionTransportTests {
         #expect(delegate.didCompleteTask)
     }
     #endif
+}
+
+private final nonisolated class FileBodyURLProtocol: URLProtocol {
+    private struct State {
+        var body = Data()
+        var usedStream = false
+    }
+
+    private static let state = Mutex(State())
+
+    static func reset() {
+        state.withLock {
+            $0.body = Data()
+            $0.usedStream = false
+        }
+    }
+
+    static func receivedBody() -> Data {
+        state.withLock { $0.body }
+    }
+
+    static func receivedThroughStream() -> Bool {
+        state.withLock { $0.usedStream }
+    }
+
+    override static func canInit(with _: URLRequest) -> Bool { true }
+
+    override static func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let stream = request.httpBodyStream
+        let received = Self.read(stream)
+        Self.state.withLock {
+            $0.body = received
+            $0.usedStream = request.httpBody == nil && stream != nil
+        }
+        guard let url = request.url,
+              let response = HTTPURLResponse(
+                  url: url,
+                  statusCode: 200,
+                  httpVersion: "HTTP/1.1",
+                  headerFields: nil
+              ) else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data("{}".utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+
+    private static func read(_ stream: InputStream?) -> Data {
+        guard let stream else { return Data() }
+        stream.open()
+        defer { stream.close() }
+        var result = Data()
+        var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+        while true {
+            let count = stream.read(&buffer, maxLength: buffer.count)
+            if count <= 0 { return result }
+            result.append(contentsOf: buffer.prefix(count))
+        }
+    }
 }
 
 private enum ResponseLimitFailure: Error {

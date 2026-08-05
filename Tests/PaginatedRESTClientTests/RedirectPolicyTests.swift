@@ -1,5 +1,6 @@
 @testable import PaginatedRESTClient
 import Foundation
+import Synchronization
 import Testing
 
 #if canImport(FoundationNetworking)
@@ -54,6 +55,66 @@ struct RedirectPolicyTests {
         #expect(!SameOriginRedirectDelegate.hasSameOrigin(origin, URL(string: "https://api.example.test:444/test")!))
     }
 
+    @Test
+    func `file-backed bodies can provide a fresh stream`() throws {
+        let expected = Data("stream me again".utf8)
+        let bodyFileURL = FileManager.default.temporaryDirectory
+            .appending(path: "PaginatedRESTClient-\(UUID().uuidString).body")
+        try expected.write(to: bodyFileURL)
+        defer { try? FileManager.default.removeItem(at: bodyFileURL) }
+        let origin = URL(string: "https://api.example.test/upload")!
+        let delegate = SameOriginRedirectDelegate(
+            requestURL: origin,
+            bodyFileURL: bodyFileURL,
+            forwardingDelegate: nil
+        )
+        let task = URLSession.shared.dataTask(with: origin)
+        defer { task.cancel() }
+
+        let received = Mutex<Data?>(nil)
+        delegate.urlSession(
+            URLSession.shared,
+            task: task,
+            needNewBodyStream: { stream in
+                received.withLock { $0 = readBodyStream(stream) }
+            }
+        )
+
+        #expect(received.withLock { $0 } == expected)
+    }
+
+    #if os(Linux)
+    @Test
+    func `the Linux bounded loader replays a file-backed body`() throws {
+        let expected = Data("Linux replay".utf8)
+        let bodyFileURL = FileManager.default.temporaryDirectory
+            .appending(path: "PaginatedRESTClient-\(UUID().uuidString).body")
+        try expected.write(to: bodyFileURL)
+        defer { try? FileManager.default.removeItem(at: bodyFileURL) }
+        let origin = URL(string: "https://api.example.test/upload")!
+        let loader = BoundedURLSessionLoader(
+            successResponseLimit: 1024,
+            errorResponseLimit: 1024,
+            requestURL: origin,
+            bodyFileURL: bodyFileURL,
+            forwardingDelegate: nil
+        )
+        let task = URLSession.shared.dataTask(with: origin)
+        defer { task.cancel() }
+        let received = Mutex<Data?>(nil)
+
+        loader.urlSession(
+            URLSession.shared,
+            task: task,
+            needNewBodyStream: { stream in
+                received.withLock { $0 = readBodyStream(stream) }
+            }
+        )
+
+        #expect(received.withLock { $0 } == expected)
+    }
+    #endif
+
     private func redirectDecision(
         from delegate: SameOriginRedirectDelegate,
         task: URLSessionTask,
@@ -69,5 +130,19 @@ struct RedirectPolicyTests {
                 completionHandler: { continuation.resume(returning: $0) }
             )
         }
+    }
+
+}
+
+private nonisolated func readBodyStream(_ stream: InputStream?) -> Data {
+    guard let stream else { return Data() }
+    stream.open()
+    defer { stream.close() }
+    var result = Data()
+    var buffer = [UInt8](repeating: 0, count: 1024)
+    while true {
+        let count = stream.read(&buffer, maxLength: buffer.count)
+        if count <= 0 { return result }
+        result.append(contentsOf: buffer.prefix(count))
     }
 }
