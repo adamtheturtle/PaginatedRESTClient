@@ -39,18 +39,24 @@ public struct URLSessionTransport: RESTTransport {
     }
 
     public nonisolated func response(for request: RESTRequest) async throws -> RESTResponse {
+        let urlRequest = Self.urlRequest(from: request)
         #if os(Linux)
         return try await BoundedURLSessionLoader(
             successResponseLimit: successResponseLimit,
             errorResponseLimit: errorResponseLimit,
+            requestURL: urlRequest.url,
             forwardingDelegate: session.delegate
         ).load(
             configuration: session.configuration,
             delegateQueue: session.delegateQueue,
-            request: Self.urlRequest(from: request)
+            request: urlRequest
         )
         #else
-        let (bytes, response) = try await session.bytes(for: Self.urlRequest(from: request))
+        let redirectDelegate = SameOriginRedirectDelegate(
+            requestURL: urlRequest.url,
+            forwardingDelegate: session.delegate
+        )
+        let (bytes, response) = try await session.bytes(for: urlRequest, delegate: redirectDelegate)
         guard let http = response as? HTTPURLResponse else {
             // A non-HTTP response is a transport-level anomaly; surface it as a URLError
             // so the paginator routes it through the error mapping's `network(_:)` case.
@@ -125,15 +131,21 @@ private final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @
     private var state = State()
     private let successResponseLimit: Int
     private let errorResponseLimit: Int
+    private let redirectDelegate: SameOriginRedirectDelegate
     private let forwardingDelegate: (any URLSessionDelegate)?
 
     init(
         successResponseLimit: Int,
         errorResponseLimit: Int,
+        requestURL: URL?,
         forwardingDelegate: (any URLSessionDelegate)?
     ) {
         self.successResponseLimit = successResponseLimit
         self.errorResponseLimit = errorResponseLimit
+        redirectDelegate = SameOriginRedirectDelegate(
+            requestURL: requestURL,
+            forwardingDelegate: forwardingDelegate
+        )
         self.forwardingDelegate = forwardingDelegate
     }
 
@@ -295,11 +307,7 @@ private extension BoundedURLSessionLoader {
         newRequest request: URLRequest,
         completionHandler: @escaping @Sendable (URLRequest?) -> Void
     ) {
-        guard let delegate = forwardingDelegate as? any URLSessionTaskDelegate else {
-            completionHandler(request)
-            return
-        }
-        delegate.urlSession(
+        redirectDelegate.urlSession(
             session,
             task: task,
             willPerformHTTPRedirection: response,
