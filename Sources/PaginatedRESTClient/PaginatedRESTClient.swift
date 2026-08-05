@@ -432,6 +432,31 @@ public struct PaginatedRESTClient {
         }
     }
 
+    private nonisolated func pathString(_ keys: [CodingKey]) -> String {
+        keys.map(\.stringValue).joined(separator: ".")
+    }
+
+    /// Decodes `data` on a background task so the (potentially large) parse doesn't run on
+    /// the main actor. Builds a fresh decoder per call - `JSONDecoder` isn't safe to share
+    /// across threads. `DecodingError`s propagate so `perform` can map them as before.
+    ///
+    /// A structured child task (not `Task.detached`) so it inherits cancellation: when a
+    /// streaming load is torn down, queued decodes bail at the check below instead of
+    /// parsing into a result that's about to be discarded. This function is `nonisolated`,
+    /// so the task still runs off the main actor.
+    private nonisolated func decodeInBackground<T: Decodable & Sendable>(
+        _: T.Type,
+        from data: Data
+    ) async throws -> T {
+        let make = decoderFactory
+        return try await Task(priority: .userInitiated) {
+            try Task.checkCancellation()
+            return try make().decode(T.self, from: data)
+        }.value
+    }
+}
+
+extension PaginatedRESTClient {
     /// Parses RFC delay-seconds and all three HTTP-date forms. A date in the past is a
     /// valid instruction to retry immediately; malformed and negative values fall back.
     nonisolated static func retryAfterDelay(_ value: String?, relativeTo now: Date) -> TimeInterval? {
@@ -470,31 +495,6 @@ public struct PaginatedRESTClient {
         return min(60, base * factor)
     }
 
-    private nonisolated func pathString(_ keys: [CodingKey]) -> String {
-        keys.map(\.stringValue).joined(separator: ".")
-    }
-
-    /// Decodes `data` on a background task so the (potentially large) parse doesn't run on
-    /// the main actor. Builds a fresh decoder per call - `JSONDecoder` isn't safe to share
-    /// across threads. `DecodingError`s propagate so `perform` can map them as before.
-    ///
-    /// A structured child task (not `Task.detached`) so it inherits cancellation: when a
-    /// streaming load is torn down, queued decodes bail at the check below instead of
-    /// parsing into a result that's about to be discarded. This function is `nonisolated`,
-    /// so the task still runs off the main actor.
-    private nonisolated func decodeInBackground<T: Decodable & Sendable>(
-        _: T.Type,
-        from data: Data
-    ) async throws -> T {
-        let make = decoderFactory
-        return try await Task(priority: .userInitiated) {
-            try Task.checkCancellation()
-            return try make().decode(T.self, from: data)
-        }.value
-    }
-}
-
-extension PaginatedRESTClient {
     nonisolated static var maxMappedErrorBodyBytes: Int { 4 * 1_024 }
     nonisolated static var maxMappedErrorBodyScalars: Int { 1_024 }
 
