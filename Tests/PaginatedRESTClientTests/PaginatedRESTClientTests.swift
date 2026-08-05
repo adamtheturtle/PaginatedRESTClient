@@ -529,15 +529,18 @@ struct PaginatedRESTClientTests {
     }
 
     @Test
-    func `case-variant duplicate response headers combine deterministically`() {
-        let response = RESTResponse(
+    func `case-variant duplicate response headers use deterministic precedence`() {
+        var response = RESTResponse(
             data: Data(),
             statusCode: 429,
             headers: ["retry-after": "20", "Retry-After": "10"]
         )
 
-        #expect(response.headers == ["retry-after": "10, 20"])
-        #expect(response.value(forHTTPHeaderField: "RETRY-AFTER") == "10, 20")
+        #expect(response.headers == ["retry-after": "10"])
+        #expect(response.value(forHTTPHeaderField: "RETRY-AFTER") == "10")
+
+        response.headers["Retry-After"] = "30"
+        #expect(response.value(forHTTPHeaderField: "retry-after") == "30")
     }
 
     @Test
