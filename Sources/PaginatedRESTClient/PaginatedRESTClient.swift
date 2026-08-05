@@ -377,10 +377,12 @@ public struct PaginatedRESTClient {
     ) async throws -> T {
         let response = try await transportResponse(for: request)
         guard (200 ..< 300).contains(response.statusCode) else {
-            let body = String(data: response.data, encoding: .utf8) ?? ""
             throw HTTPAttemptFailure(
                 response: response,
-                mappedError: errors.http(status: response.statusCode, body: body)
+                mappedError: errors.http(
+                    status: response.statusCode,
+                    body: Self.boundedErrorBody(response.data)
+                )
             )
         }
 
@@ -399,6 +401,8 @@ public struct PaginatedRESTClient {
             )
         } catch let DecodingError.dataCorrupted(ctx) {
             throw errors.decode("corrupted at \(pathString(ctx.codingPath)): \(ctx.debugDescription)")
+        } catch is CancellationError { throw CancellationError() } catch {
+            throw errors.decode(Self.boundedDecodeDetail(error))
         }
     }
 
@@ -428,6 +432,31 @@ public struct PaginatedRESTClient {
         }
     }
 
+    private nonisolated func pathString(_ keys: [CodingKey]) -> String {
+        keys.map(\.stringValue).joined(separator: ".")
+    }
+
+    /// Decodes `data` on a background task so the (potentially large) parse doesn't run on
+    /// the main actor. Builds a fresh decoder per call - `JSONDecoder` isn't safe to share
+    /// across threads. `DecodingError`s propagate so `perform` can map them as before.
+    ///
+    /// A structured child task (not `Task.detached`) so it inherits cancellation: when a
+    /// streaming load is torn down, queued decodes bail at the check below instead of
+    /// parsing into a result that's about to be discarded. This function is `nonisolated`,
+    /// so the task still runs off the main actor.
+    private nonisolated func decodeInBackground<T: Decodable & Sendable>(
+        _: T.Type,
+        from data: Data
+    ) async throws -> T {
+        let make = decoderFactory
+        return try await Task(priority: .userInitiated) {
+            try Task.checkCancellation()
+            return try make().decode(T.self, from: data)
+        }.value
+    }
+}
+
+extension PaginatedRESTClient {
     /// Parses RFC delay-seconds and all three HTTP-date forms. A date in the past is a
     /// valid instruction to retry immediately; malformed and negative values fall back.
     nonisolated static func retryAfterDelay(_ value: String?, relativeTo now: Date) -> TimeInterval? {
@@ -466,31 +495,51 @@ public struct PaginatedRESTClient {
         return min(60, base * factor)
     }
 
-    private nonisolated func pathString(_ keys: [CodingKey]) -> String {
-        keys.map(\.stringValue).joined(separator: ".")
+    nonisolated static var maxMappedErrorBodyBytes: Int { 4 * 1_024 }
+    nonisolated static var maxMappedErrorBodyScalars: Int { 1_024 }
+
+    nonisolated static func boundedErrorBody(_ data: Data) -> String {
+        let prefix = data.prefix(maxMappedErrorBodyBytes)
+        // Lossy decoding is deliberate: invalid bytes become a bounded replacement
+        // scalar instead of making the mapped error body disappear.
+        // swiftlint:disable:next optional_data_string_conversion
+        let decoded = String(decoding: [UInt8](prefix), as: UTF8.self)
+        return sanitizedText(
+            decoded,
+            maxScalars: maxMappedErrorBodyScalars,
+            truncated: data.count > maxMappedErrorBodyBytes
+        )
     }
 
-    /// Decodes `data` on a background task so the (potentially large) parse doesn't run on
-    /// the main actor. Builds a fresh decoder per call - `JSONDecoder` isn't safe to share
-    /// across threads. `DecodingError`s propagate so `perform` can map them as before.
-    ///
-    /// A structured child task (not `Task.detached`) so it inherits cancellation: when a
-    /// streaming load is torn down, queued decodes bail at the check below instead of
-    /// parsing into a result that's about to be discarded. This function is `nonisolated`,
-    /// so the task still runs off the main actor.
-    private nonisolated func decodeInBackground<T: Decodable & Sendable>(
-        _: T.Type,
-        from data: Data
-    ) async throws -> T {
-        let make = decoderFactory
-        return try await Task(priority: .userInitiated) {
-            try Task.checkCancellation()
-            return try make().decode(T.self, from: data)
-        }.value
+    nonisolated static func boundedDecodeDetail(_ error: any Error) -> String {
+        sanitizedText(
+            "decode failed (\(type(of: error))): \(error.localizedDescription)",
+            maxScalars: 512,
+            truncated: false
+        )
     }
-}
 
-extension PaginatedRESTClient {
+    private nonisolated static func sanitizedText(
+        _ text: String,
+        maxScalars: Int,
+        truncated: Bool
+    ) -> String {
+        var result = String.UnicodeScalarView()
+        var scalarTruncated = false
+        for scalar in text.unicodeScalars {
+            guard result.count < maxScalars else { scalarTruncated = true; break }
+            switch scalar.properties.generalCategory {
+            case .control, .format, .privateUse, .surrogate, .unassigned:
+                result.append("�")
+            default:
+                result.append(scalar)
+            }
+        }
+        var string = String(result)
+        if truncated || scalarTruncated { string += " [truncated]" }
+        return string
+    }
+
     nonisolated static func retryBackoffDelay(retryNumber: Int) -> TimeInterval {
         let exponent = Double(min(max(retryNumber - 1, 0), 10))
         return min(maxRetryDelay, 0.3 * pow(2, exponent))
@@ -516,10 +565,12 @@ public extension PaginatedRESTClient {
         do {
             let response = try await transportResponse(for: request)
             guard (200 ..< 300).contains(response.statusCode) else {
-                let body = String(data: response.data, encoding: .utf8) ?? ""
                 throw HTTPAttemptFailure(
                     response: response,
-                    mappedError: errors.http(status: response.statusCode, body: body)
+                    mappedError: errors.http(
+                        status: response.statusCode,
+                        body: Self.boundedErrorBody(response.data)
+                    )
                 )
             }
         } catch let failure as HTTPAttemptFailure {

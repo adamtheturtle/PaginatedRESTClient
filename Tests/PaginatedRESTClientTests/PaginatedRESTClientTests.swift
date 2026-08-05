@@ -38,6 +38,30 @@ private struct TestErrors: RESTTransportErrorMapping {
     }
 }
 
+private enum DetailedFailure: Error, Equatable {
+    case http(Int, String)
+    case decode(String)
+    case unexpected
+}
+
+private struct DetailedErrors: RESTTransportErrorMapping {
+    nonisolated func missingAPIKey() -> any Error { DetailedFailure.unexpected }
+    nonisolated func http(status: Int, body: String) -> any Error { DetailedFailure.http(status, body) }
+    nonisolated func decode(_ detail: String) -> any Error { DetailedFailure.decode(detail) }
+    nonisolated func network(_: URLError) -> any Error { DetailedFailure.unexpected }
+    nonisolated func isTransient(_: any Error) -> Bool { false }
+}
+
+private nonisolated struct RejectingValue: Decodable, Sendable {
+    struct ValidationError: LocalizedError {
+        var errorDescription: String? { "domain validation rejected the value" }
+    }
+
+    init(from _: any Decoder) throws {
+        throw ValidationError()
+    }
+}
+
 private nonisolated struct Thing: Decodable, Equatable {
     let id: Int
 }
@@ -524,6 +548,67 @@ private func makeClient(
 
 @Suite("PaginatedRESTClient")
 struct PaginatedRESTClientTests {
+    @Test
+    func `custom decoding failures use the configured mapping`() async throws {
+        let client = PaginatedRESTClient(
+            apiKey: "test-key",
+            baseURL: try #require(URL(string: "https://example.test")),
+            transport: FixedResponseTransport(data: Data("{}".utf8), status: 200),
+            decoderFactory: { JSONDecoder() },
+            encoderFactory: { JSONEncoder() },
+            errors: DetailedErrors()
+        )
+
+        let error = await #expect(throws: DetailedFailure.self) {
+            _ = try await client.fetch(RejectingValue.self, path: "/value")
+        }
+        guard case let .decode(detail) = error else {
+            Issue.record("Expected a mapped decode failure")
+            return
+        }
+        #expect(detail.contains("domain validation rejected the value"))
+    }
+
+    @Test
+    func `mapped HTTP bodies are bounded sanitized and marked when truncated`() async throws {
+        let body = Data([0, 0xFF]) + Data(repeating: 97, count: 20_000)
+        let client = PaginatedRESTClient(
+            apiKey: "test-key",
+            baseURL: try #require(URL(string: "https://example.test")),
+            transport: FixedResponseTransport(data: body, status: 500),
+            decoderFactory: { JSONDecoder() },
+            encoderFactory: { JSONEncoder() },
+            errors: DetailedErrors()
+        )
+
+        let error = await #expect(throws: DetailedFailure.self) {
+            _ = try await client.fetch(Thing.self, path: "/value")
+        }
+        guard case let .http(status, mappedBody) = error else {
+            Issue.record("Expected a mapped HTTP failure")
+            return
+        }
+        #expect(status == 500)
+        #expect(mappedBody.hasSuffix(" [truncated]"))
+        #expect(mappedBody.unicodeScalars.count <= 1_037)
+        #expect(!mappedBody.unicodeScalars.contains(where: { $0.properties.generalCategory == .control }))
+    }
+
+    @Test
+    func `case-variant duplicate response headers use deterministic precedence`() {
+        var response = RESTResponse(
+            data: Data(),
+            statusCode: 429,
+            headers: ["retry-after": "20", "Retry-After": "10"]
+        )
+
+        #expect(response.headers == ["retry-after": "10"])
+        #expect(response.value(forHTTPHeaderField: "RETRY-AFTER") == "10")
+
+        response.headers["Retry-After"] = "30"
+        #expect(response.value(forHTTPHeaderField: "retry-after") == "30")
+    }
+
     @Test
     func `fetchAllPages stitches every page in order`() async throws {
         let items = try await makeClient().fetchAllPages(ThingsPage.self, path: "/things/")
