@@ -379,6 +379,10 @@ public struct PaginatedRESTClient {
         let response: RESTResponse
         do {
             response = try await transport.response(for: request)
+        } catch let overflow as RESTResponseTooLargeError {
+            throw errors.decode(
+                "HTTP \(overflow.statusCode) response exceeded the \(overflow.limit)-byte limit"
+            )
         } catch let urlError as URLError {
             try Task.checkCancellation()
             // Surface transport failures (offline, timeout, unreachable) as a typed,

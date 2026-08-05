@@ -19,9 +19,18 @@ import FoundationNetworking
 /// stub `URLProtocol`) when you need one.
 public struct URLSessionTransport: RESTTransport {
     nonisolated let session: URLSession
+    nonisolated let successResponseLimit: Int
+    nonisolated let errorResponseLimit: Int
 
-    public init(session: URLSession = .shared) {
+    public init(
+        session: URLSession = .shared,
+        successResponseLimit: Int = 10 * 1024 * 1024,
+        errorResponseLimit: Int = 64 * 1024
+    ) {
+        precondition(successResponseLimit >= 0 && errorResponseLimit >= 0, "Response limits must not be negative")
         self.session = session
+        self.successResponseLimit = successResponseLimit
+        self.errorResponseLimit = errorResponseLimit
     }
 
     public nonisolated func data(for request: RESTRequest) async throws -> (Data, Int) {
@@ -30,17 +39,39 @@ public struct URLSessionTransport: RESTTransport {
     }
 
     public nonisolated func response(for request: RESTRequest) async throws -> RESTResponse {
-        let (data, response) = try await session.data(for: Self.urlRequest(from: request))
+        #if os(Linux)
+        return try await BoundedURLSessionLoader(
+            successResponseLimit: successResponseLimit,
+            errorResponseLimit: errorResponseLimit
+        ).load(configuration: session.configuration, request: Self.urlRequest(from: request))
+        #else
+        let (bytes, response) = try await session.bytes(for: Self.urlRequest(from: request))
         guard let http = response as? HTTPURLResponse else {
             // A non-HTTP response is a transport-level anomaly; surface it as a URLError
             // so the paginator routes it through the error mapping's `network(_:)` case.
             throw URLError(.badServerResponse)
+        }
+        let limit = (200 ..< 300).contains(http.statusCode) ? successResponseLimit : errorResponseLimit
+        guard http.expectedContentLength < 0 || http.expectedContentLength <= Int64(limit) else {
+            throw RESTResponseTooLargeError(statusCode: http.statusCode, limit: limit)
+        }
+
+        var data = Data()
+        if http.expectedContentLength > 0 {
+            data.reserveCapacity(Int(http.expectedContentLength))
+        }
+        for try await byte in bytes {
+            guard data.count < limit else {
+                throw RESTResponseTooLargeError(statusCode: http.statusCode, limit: limit)
+            }
+            data.append(byte)
         }
         let headers = http.allHeaderFields.reduce(into: [String: String]()) { result, field in
             let name = (field.key as? String) ?? String(describing: field.key)
             result[name] = String(describing: field.value)
         }
         return RESTResponse(data: data, statusCode: http.statusCode, headers: headers)
+        #endif
     }
 
     /// Translates the backend-neutral `RESTRequest` into a `URLRequest`.
@@ -54,3 +85,158 @@ public struct URLSessionTransport: RESTTransport {
         return urlRequest
     }
 }
+
+nonisolated struct RESTResponseTooLargeError: Error, Equatable {
+    let statusCode: Int
+    let limit: Int
+}
+
+#if os(Linux)
+private final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private struct State {
+        var continuation: CheckedContinuation<RESTResponse, any Error>?
+        var session: URLSession?
+        var task: URLSessionDataTask?
+        var response: HTTPURLResponse?
+        var data = Data()
+        var limit = 0
+        var completed = false
+        var cancelled = false
+    }
+
+    private struct CancellationResources {
+        let continuation: CheckedContinuation<RESTResponse, any Error>?
+        let task: URLSessionDataTask?
+        let session: URLSession?
+    }
+
+    private let lock = NSLock()
+    private var state = State()
+    private let successResponseLimit: Int
+    private let errorResponseLimit: Int
+
+    init(successResponseLimit: Int, errorResponseLimit: Int) {
+        self.successResponseLimit = successResponseLimit
+        self.errorResponseLimit = errorResponseLimit
+    }
+
+    func load(configuration: URLSessionConfiguration, request: URLRequest) async throws -> RESTResponse {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let task = lock.withLock { () -> URLSessionDataTask? in
+                    guard !state.cancelled else { return nil }
+                    let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+                    let task = session.dataTask(with: request)
+                    state.continuation = continuation
+                    state.session = session
+                    state.task = task
+                    return task
+                }
+                guard let task else {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                task.resume()
+            }
+        } onCancel: {
+            cancel()
+        }
+    }
+
+    func urlSession(
+        _: URLSession,
+        dataTask _: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping @Sendable (URLSession.ResponseDisposition) -> Void
+    ) {
+        guard let http = response as? HTTPURLResponse else {
+            completionHandler(.cancel)
+            complete(.failure(URLError(.badServerResponse)))
+            return
+        }
+        let limit = (200 ..< 300).contains(http.statusCode) ? successResponseLimit : errorResponseLimit
+        guard http.expectedContentLength < 0 || http.expectedContentLength <= Int64(limit) else {
+            completionHandler(.cancel)
+            complete(.failure(RESTResponseTooLargeError(statusCode: http.statusCode, limit: limit)))
+            return
+        }
+
+        lock.withLock {
+            guard !state.completed else { return }
+            state.response = http
+            state.limit = limit
+            if http.expectedContentLength > 0 {
+                state.data.reserveCapacity(Int(http.expectedContentLength))
+            }
+        }
+        completionHandler(.allow)
+    }
+
+    func urlSession(_: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        let overflow = lock.withLock { () -> RESTResponseTooLargeError? in
+            guard !state.completed, let response = state.response else { return nil }
+            guard data.count <= state.limit - state.data.count else {
+                return RESTResponseTooLargeError(statusCode: response.statusCode, limit: state.limit)
+            }
+            state.data.append(data)
+            return nil
+        }
+        if let overflow {
+            dataTask.cancel()
+            complete(.failure(overflow))
+        }
+    }
+
+    func urlSession(_: URLSession, task _: URLSessionTask, didCompleteWithError error: (any Error)?) {
+        if let error {
+            complete(.failure(error))
+            return
+        }
+        let result = lock.withLock { () -> RESTResponse? in
+            guard let response = state.response else { return nil }
+            let headers = response.allHeaderFields.reduce(into: [String: String]()) { result, field in
+                let name = (field.key as? String) ?? String(describing: field.key)
+                result[name] = String(describing: field.value)
+            }
+            return RESTResponse(data: state.data, statusCode: response.statusCode, headers: headers)
+        }
+        complete(result.map(Result.success) ?? .failure(URLError(.badServerResponse)))
+    }
+
+    private func cancel() {
+        let resources = lock.withLock { () -> CancellationResources in
+            state.cancelled = true
+            guard !state.completed else {
+                return CancellationResources(continuation: nil, task: nil, session: nil)
+            }
+            state.completed = true
+            let result = CancellationResources(
+                continuation: state.continuation,
+                task: state.task,
+                session: state.session
+            )
+            state.continuation = nil
+            state.task = nil
+            state.session = nil
+            return result
+        }
+        resources.task?.cancel()
+        resources.session?.invalidateAndCancel()
+        resources.continuation?.resume(throwing: CancellationError())
+    }
+
+    private func complete(_ result: Result<RESTResponse, any Error>) {
+        let resources = lock.withLock { () -> (CheckedContinuation<RESTResponse, any Error>?, URLSession?) in
+            guard !state.completed else { return (nil, nil) }
+            state.completed = true
+            let result = (state.continuation, state.session)
+            state.continuation = nil
+            state.task = nil
+            state.session = nil
+            return result
+        }
+        resources.1?.finishTasksAndInvalidate()
+        resources.0?.resume(with: result)
+    }
+}
+#endif
