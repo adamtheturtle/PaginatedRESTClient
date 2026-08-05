@@ -679,6 +679,7 @@ nonisolated func fetchKnownPages<W: PagedResponse>(
             // Emit a new snapshot whenever the contiguous prefix grows.
             var grew = false
             while let ready = pending.removeValue(forKey: nextToEmit) {
+                try validateParallelIdentities(ready)
                 let added = Self.appendNew(
                     ready.pageItems, to: &collected, seen: &seen, identity: W.identity(of:)
                 )
@@ -695,6 +696,12 @@ nonisolated func fetchKnownPages<W: PagedResponse>(
     }
     items = collected
     return tailNextPage
+}
+
+nonisolated func validateParallelIdentities<W: PagedResponse>(_ page: W) throws {
+    guard page.pageItems.allSatisfy({ W.identity(of: $0) != nil }) else {
+        throw errors.decode("parallel pagination requires a stable identity for every item")
+    }
 }
 
 /// Walks `next_page` links one page at a time, appending and emitting each page.
