@@ -184,6 +184,38 @@ private nonisolated struct FixedFirstPageTransport: RESTTransport {
     }
 }
 
+private nonisolated final class CapturedRequests: @unchecked Sendable {
+    private let lock = NSLock()
+    private var requests: [RESTRequest] = []
+
+    func append(_ request: RESTRequest) -> Int {
+        lock.withLock {
+            requests.append(request)
+            return requests.count
+        }
+    }
+
+    var values: [RESTRequest] {
+        lock.withLock { requests }
+    }
+}
+
+private nonisolated struct NextPageTransport: RESTTransport {
+    let nextPage: String
+    let captured: CapturedRequests
+
+    func data(for request: RESTRequest) async throws -> (Data, Int) {
+        let requestNumber = captured.append(request)
+        let next: Any = requestNumber == 1 ? nextPage : NSNull()
+        let data = try JSONSerialization.data(withJSONObject: [
+            "things": [["id": requestNumber]],
+            "next_page": next,
+            "total": NSNull()
+        ])
+        return (data, 200)
+    }
+}
+
 /// Serves a fixed two-page fixture keyed off the `page` query item, with no real
 /// networking - a `RESTTransport` stub in place of the old `URLProtocol`/`URLSession`
 /// machinery, so the tests exercise the paginator over the same seam consumers use and
@@ -407,6 +439,43 @@ struct PaginatedRESTClientTests {
         #expect(request.method == "GET")
         #expect(request.headers["Authorization"] == "Bearer test-key")
         #expect(request.headers["Accept"] == "application/json")
+    }
+
+    @Test(arguments: [
+        "https://attacker.test/things/?page=2",
+        "http://example.test/things/?page=2",
+        "https://example.test:444/things/?page=2",
+        "https://user:password@example.test/things/?page=2"
+    ])
+    func `next page cannot move bearer credentials off the configured origin`(
+        nextPage: String
+    ) async throws {
+        let captured = CapturedRequests()
+        let client = makeClient(transport: NextPageTransport(nextPage: nextPage, captured: captured))
+
+        await #expect(throws: TestErrors.Failure.http(0)) {
+            _ = try await client.fetchAllPages(Unidentified.self, path: "/things/")
+        }
+
+        #expect(captured.values.count == 1)
+        #expect(captured.values.first?.headers["Authorization"] == "Bearer test-key")
+    }
+
+    @Test(arguments: [
+        "/things/?page=2",
+        "https://EXAMPLE.test:443/things/?page=2"
+    ])
+    func `same-origin relative and absolute next pages remain authorized`(
+        nextPage: String
+    ) async throws {
+        let captured = CapturedRequests()
+        let client = makeClient(transport: NextPageTransport(nextPage: nextPage, captured: captured))
+
+        let items = try await client.fetchAllPages(Unidentified.self, path: "/things/")
+
+        #expect(items == [Thing(id: 1), Thing(id: 2)])
+        #expect(captured.values.count == 2)
+        #expect(captured.values.last?.headers["Authorization"] == "Bearer test-key")
     }
 
     @Test
