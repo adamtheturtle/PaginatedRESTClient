@@ -202,11 +202,22 @@ private nonisolated final class CapturedRequests: @unchecked Sendable {
 
 private nonisolated struct NextPageTransport: RESTTransport {
     let nextPage: String
+    let laterNextPage: String?
     let captured: CapturedRequests
+
+    init(nextPage: String, laterNextPage: String? = nil, captured: CapturedRequests) {
+        self.nextPage = nextPage
+        self.laterNextPage = laterNextPage
+        self.captured = captured
+    }
 
     func data(for request: RESTRequest) async throws -> (Data, Int) {
         let requestNumber = captured.append(request)
-        let next: Any = requestNumber == 1 ? nextPage : NSNull()
+        let next: Any = switch requestNumber {
+        case 1: nextPage
+        case 2: laterNextPage ?? NSNull()
+        default: NSNull()
+        }
         let data = try JSONSerialization.data(withJSONObject: [
             "things": [["id": requestNumber]],
             "next_page": next,
@@ -488,6 +499,35 @@ struct PaginatedRESTClientTests {
 
         #expect(items == [Thing(id: 1)])
         #expect(captured.values.count == 1)
+    }
+
+    @Test(arguments: ["http://[::1", "https://"])
+    func `an invalid initial next page fails instead of truncating`(nextPage: String) async throws {
+        let captured = CapturedRequests()
+        let client = makeClient(transport: NextPageTransport(nextPage: nextPage, captured: captured))
+
+        await #expect(throws: TestErrors.Failure.http(0)) {
+            _ = try await client.fetchAllPages(Unidentified.self, path: "/things/")
+        }
+
+        #expect(captured.values.count == 1)
+    }
+
+    @Test
+    func `an invalid later next page fails instead of returning a prefix`() async throws {
+        let captured = CapturedRequests()
+        let transport = NextPageTransport(
+            nextPage: "?page=2",
+            laterNextPage: "http://[::1",
+            captured: captured
+        )
+
+        await #expect(throws: TestErrors.Failure.http(0)) {
+            _ = try await makeClient(transport: transport)
+                .fetchAllPages(Unidentified.self, path: "/things/")
+        }
+
+        #expect(captured.values.count == 2)
     }
 
     @Test
