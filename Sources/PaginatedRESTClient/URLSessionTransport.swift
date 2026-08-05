@@ -97,9 +97,20 @@ public struct URLSessionTransport: RESTTransport {
     }
 }
 
-nonisolated struct RESTResponseTooLargeError: Error, Equatable {
-    let statusCode: Int
-    let limit: Int
+/// A response exceeded the configured byte ceiling while headers or body bytes were
+/// arriving. Direct ``RESTTransport`` consumers can use these facts to map the failure
+/// into their own domain error; ``PaginatedRESTClient`` maps it through
+/// ``RESTTransportErrorMapping/decode(_:)`` automatically.
+public nonisolated struct RESTResponseTooLargeError: Error, Equatable, Sendable {
+    /// HTTP status from the response whose body exceeded its applicable limit.
+    public let statusCode: Int
+    /// The configured maximum number of response-body bytes.
+    public let limit: Int
+
+    public init(statusCode: Int, limit: Int) {
+        self.statusCode = statusCode
+        self.limit = limit
+    }
 }
 
 #if os(Linux)
