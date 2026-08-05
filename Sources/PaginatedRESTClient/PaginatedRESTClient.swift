@@ -174,6 +174,10 @@ public struct PaginatedRESTClient {
     /// response could otherwise overflow `total + pageSize - 1` and trap the process.
     nonisolated static let maxReportedTotal = 100_000_000
 
+    /// Retry delays, including server-provided `Retry-After` values, never block the
+    /// shared client for longer than one minute.
+    nonisolated static let maxRetryDelay: TimeInterval = 60
+
     public init(
         apiKey: String,
         baseURL: URL,
@@ -285,6 +289,11 @@ public struct PaginatedRESTClient {
         request: RESTRequest,
         maxAttempts: Int = 3
     ) async throws -> T {
+        guard maxAttempts > 0 else { throw errors.decode("maxAttempts must be positive") }
+        guard Self.methodIsIdempotent(request.method) else {
+            return try await perform(type, request: request)
+        }
+
         var attempt = 0
         while true {
             do {
@@ -293,20 +302,19 @@ public struct PaginatedRESTClient {
                 attempt += 1
 
                 if failure.response.statusCode == 429 {
+                    guard attempt < maxAttempts, errors.isTransient(failure.mappedError) else {
+                        throw failure.mappedError
+                    }
                     let now = retryRuntime.now()
                     let retryAfter = Self.retryAfterDelay(
                         failure.response.value(forHTTPHeaderField: "Retry-After"),
                         relativeTo: now
                     )
-                    let delay = retryAfter ?? Self.rateLimitFallbackDelay(
+                    let delay = min(Self.maxRetryDelay, retryAfter ?? Self.rateLimitFallbackDelay(
                         retryNumber: attempt,
                         jitter: retryRuntime.jitter()
-                    )
+                    ))
                     rateLimitCooldown.extend(until: now.addingTimeInterval(delay))
-
-                    guard attempt < maxAttempts, errors.isTransient(failure.mappedError) else {
-                        throw failure.mappedError
-                    }
                     log("Rate limited on \(request.url.path); retry \(attempt)/\(maxAttempts - 1) "
                         + "after shared \(String(format: "%.3f", delay))s cooldown")
                     try await waitForRateLimitCooldown()
@@ -317,7 +325,7 @@ public struct PaginatedRESTClient {
                     throw failure.mappedError
                 }
                 log("Transient failure on \(request.url.path); retry \(attempt)/\(maxAttempts - 1)")
-                try await retryRuntime.sleep(0.3 * pow(2, Double(attempt - 1)))
+                try await retryRuntime.sleep(Self.retryBackoffDelay(retryNumber: attempt))
             } catch {
                 attempt += 1
                 guard attempt < maxAttempts, errors.isTransient(error) else { throw error }
@@ -325,7 +333,7 @@ public struct PaginatedRESTClient {
                 log("Transient failure on \(request.url.path); retry \(attempt)/\(maxAttempts - 1)")
                 // Preserve the existing 300ms, then 600ms exponential policy for
                 // non-HTTP transient errors. The injected sleep remains cancellable.
-                try await retryRuntime.sleep(0.3 * pow(2, Double(attempt - 1)))
+                try await retryRuntime.sleep(Self.retryBackoffDelay(retryNumber: attempt))
             }
         }
     }
@@ -478,6 +486,17 @@ public struct PaginatedRESTClient {
             try Task.checkCancellation()
             return try make().decode(T.self, from: data)
         }.value
+    }
+}
+
+extension PaginatedRESTClient {
+    nonisolated static func retryBackoffDelay(retryNumber: Int) -> TimeInterval {
+        let exponent = Double(min(max(retryNumber - 1, 0), 10))
+        return min(maxRetryDelay, 0.3 * pow(2, exponent))
+    }
+
+    nonisolated static func methodIsIdempotent(_ method: String) -> Bool {
+        ["GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE"].contains(method.uppercased())
     }
 }
 

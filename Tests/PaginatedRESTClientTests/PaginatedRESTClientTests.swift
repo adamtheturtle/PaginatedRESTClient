@@ -385,6 +385,50 @@ private nonisolated final class RetryOnceTransport: RESTTransport, @unchecked Se
     }
 }
 
+private nonisolated final class CountingStatusTransport: RESTTransport, @unchecked Sendable {
+    private let lock = NSLock()
+    private var attempts = 0
+    let status: Int
+
+    init(status: Int) {
+        self.status = status
+    }
+
+    func data(for _: RESTRequest) async throws -> (Data, Int) {
+        lock.withLock { attempts += 1 }
+        let body = status == 200 ? #"{"id":1}"# : "failure"
+        return (Data(body.utf8), status)
+    }
+
+    var requestCount: Int { lock.withLock { attempts } }
+}
+
+private nonisolated final class TerminalRateLimitTransport: RESTTransport, @unchecked Sendable {
+    private let lock = NSLock()
+    private var paths: [String] = []
+
+    func response(for request: RESTRequest) async throws -> RESTResponse {
+        lock.withLock { paths.append(request.url.path) }
+        if request.url.path == "/limited" {
+            return RESTResponse(
+                data: Data("limited".utf8),
+                statusCode: 429,
+                headers: ["Retry-After": "600"]
+            )
+        }
+        return RESTResponse(data: Data(#"{"id":1}"#.utf8), statusCode: 200)
+    }
+
+    func data(for request: RESTRequest) async throws -> (Data, Int) {
+        let response = try await response(for: request)
+        return (response.data, response.statusCode)
+    }
+
+    func requestCount(path: String) -> Int {
+        lock.withLock { paths.count(where: { $0 == path }) }
+    }
+}
+
 /// Makes pages 2 and 3 reach their first 429 together, then serves both successfully.
 /// The barrier prevents scheduler order from weakening the shared-cooldown assertion.
 private nonisolated final class ConcurrentRateLimitTransport: RESTTransport, @unchecked Sendable {
@@ -643,6 +687,38 @@ struct PaginatedRESTClientTests {
 @Suite("Rate-limit retry policy")
 struct RateLimitRetryTests {
     @Test
+    func `nonpositive attempts issue no request`() async throws {
+        let transport = CountingStatusTransport(status: 200)
+        let client = makeClient(transport: transport)
+        let request = client.authorizedGET(try #require(URL(string: "https://example.test/things/1")))
+
+        await #expect(throws: TestErrors.Failure.decode) {
+            _ = try await client.performWithRetry(Thing.self, request: request, maxAttempts: 0)
+        }
+        #expect(transport.requestCount == 0)
+    }
+
+    @Test
+    func `non-idempotent requests are never retried`() async throws {
+        let transport = CountingStatusTransport(status: 500)
+        let client = makeClient(transport: transport)
+        let request = RESTRequest(
+            url: try #require(URL(string: "https://example.test/mutation")),
+            method: "POST"
+        )
+
+        await #expect(throws: TestErrors.Failure.http(500)) {
+            _ = try await client.performWithRetry(Thing.self, request: request, maxAttempts: 3)
+        }
+        #expect(transport.requestCount == 1)
+    }
+
+    @Test
+    func `retry backoff remains finite for extreme attempt counts`() {
+        #expect(PaginatedRESTClient.retryBackoffDelay(retryNumber: .max) == 60)
+    }
+
+    @Test
     func `retry-after parses delta seconds and HTTP dates`() throws {
         var components = DateComponents()
         components.calendar = Calendar(identifier: .gregorian)
@@ -727,6 +803,61 @@ struct RateLimitRetryTests {
 
         #expect(try await task.value == Thing(id: 1))
         #expect(transport.requestCount == 2)
+    }
+
+    @Test
+    func `an extreme Retry-After value is capped`() async throws {
+        let clock = TestClock()
+        let sleeper = ControlledSleeper()
+        let transport = RetryOnceTransport(retryAfter: "999999999")
+        let client = makeClient(
+            transport: transport,
+            retryRuntime: RetryRuntime(
+                now: { clock.now },
+                sleep: { try await sleeper.sleep(for: $0) },
+                jitter: { 0 }
+            )
+        )
+        let request = client.authorizedGET(try #require(URL(string: "https://example.test/things/1")))
+        let task = Task { try await client.performWithRetry(Thing.self, request: request) }
+
+        while sleeper.requestedDelays.isEmpty { await Task.yield() }
+        #expect(sleeper.requestedDelays == [60])
+        clock.advance(by: 60)
+        sleeper.resumeAll()
+
+        #expect(try await task.value == Thing(id: 1))
+    }
+
+    @Test
+    func `a terminal rate limit does not delay a later request`() async throws {
+        let clock = TestClock()
+        let sleeper = ControlledSleeper()
+        let transport = TerminalRateLimitTransport()
+        let client = makeClient(
+            transport: transport,
+            retryRuntime: RetryRuntime(
+                now: { clock.now },
+                sleep: { try await sleeper.sleep(for: $0) },
+                jitter: { 0 }
+            )
+        )
+        let limited = client.authorizedGET(try #require(URL(string: "https://example.test/limited")))
+        await #expect(throws: TestErrors.Failure.http(429)) {
+            _ = try await client.performWithRetry(Thing.self, request: limited, maxAttempts: 1)
+        }
+
+        let next = client.authorizedGET(try #require(URL(string: "https://example.test/next")))
+        let task = Task { try await client.performWithRetry(Thing.self, request: next, maxAttempts: 1) }
+        while transport.requestCount(path: "/next") == 0, sleeper.requestedDelays.isEmpty {
+            await Task.yield()
+        }
+        #expect(sleeper.requestedDelays.isEmpty)
+        if !sleeper.requestedDelays.isEmpty {
+            clock.advance(by: 60)
+            sleeper.resumeAll()
+        }
+        #expect(try await task.value == Thing(id: 1))
     }
 
     @Test
