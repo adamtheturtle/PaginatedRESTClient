@@ -462,6 +462,7 @@ struct PaginatedRESTClientTests {
     }
 
     @Test(arguments: [
+        "?page=2",
         "/things/?page=2",
         "https://EXAMPLE.test:443/things/?page=2"
     ])
@@ -476,6 +477,17 @@ struct PaginatedRESTClientTests {
         #expect(items == [Thing(id: 1), Thing(id: 2)])
         #expect(captured.values.count == 2)
         #expect(captured.values.last?.headers["Authorization"] == "Bearer test-key")
+    }
+
+    @Test
+    func `an empty next page terminates the walk without an error`() async throws {
+        let captured = CapturedRequests()
+        let client = makeClient(transport: NextPageTransport(nextPage: "", captured: captured))
+
+        let items = try await client.fetchAllPages(Unidentified.self, path: "/things/")
+
+        #expect(items == [Thing(id: 1)])
+        #expect(captured.values.count == 1)
     }
 
     @Test

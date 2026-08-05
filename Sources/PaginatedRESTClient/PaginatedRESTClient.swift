@@ -718,9 +718,11 @@ nonisolated func walkNextPages<W: PagedResponse>(
 /// where the bearer credential is sent. Relative links are supported, while every
 /// absolute result must remain on the configured HTTP(S) origin.
 nonisolated func validatedNextPageURL(_ value: String) throws -> URL? {
-    guard URL(string: value) != nil,
-          let resolved = URL(string: value, relativeTo: baseURL)?.absoluteURL,
-          let base = URLComponents(url: baseURL, resolvingAgainstBaseURL: false),
+    guard !value.isEmpty,
+          let resolved = URL(string: value, relativeTo: baseURL)?.absoluteURL
+    else { return nil }
+
+    guard let base = URLComponents(url: baseURL, resolvingAgainstBaseURL: false),
           let candidate = URLComponents(url: resolved, resolvingAgainstBaseURL: false),
           let baseScheme = base.scheme?.lowercased(),
           let candidateScheme = candidate.scheme?.lowercased(),
