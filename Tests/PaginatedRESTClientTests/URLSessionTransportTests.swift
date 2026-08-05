@@ -57,6 +57,24 @@ struct URLSessionTransportTests {
         }
         #expect(detail.contains("HTTP 200 response exceeded the 8-byte limit"))
     }
+
+    #if os(Linux)
+    @Test
+    func `the Linux bounded loader preserves the supplied session delegate`() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ResponseLimitURLProtocol.self]
+        let delegate = CompletionRecordingDelegate()
+        let queue = OperationQueue()
+        queue.maxConcurrentOperationCount = 1
+        let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: queue)
+        let transport = URLSessionTransport(session: session)
+        let request = RESTRequest(url: URL(string: "https://example.test/200")!, method: "GET")
+
+        _ = try await transport.response(for: request)
+
+        #expect(delegate.didCompleteTask)
+    }
+    #endif
 }
 
 private enum ResponseLimitFailure: Error {
@@ -73,6 +91,21 @@ private struct ResponseLimitErrors: RESTTransportErrorMapping {
 }
 
 private nonisolated struct ResponseLimitValue: Decodable, Sendable {}
+
+#if os(Linux)
+private final nonisolated class CompletionRecordingDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    private var completionRecorded = false
+
+    var didCompleteTask: Bool {
+        lock.withLock { completionRecorded }
+    }
+
+    func urlSession(_: URLSession, task _: URLSessionTask, didCompleteWithError _: (any Error)?) {
+        lock.withLock { completionRecorded = true }
+    }
+}
+#endif
 
 private final nonisolated class ResponseLimitURLProtocol: URLProtocol {
     override static func canInit(with _: URLRequest) -> Bool { true }
