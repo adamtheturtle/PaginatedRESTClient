@@ -368,10 +368,12 @@ public struct PaginatedRESTClient {
     ) async throws -> T {
         let response = try await transportResponse(for: request)
         guard (200 ..< 300).contains(response.statusCode) else {
-            let body = String(data: response.data, encoding: .utf8) ?? ""
             throw HTTPAttemptFailure(
                 response: response,
-                mappedError: errors.http(status: response.statusCode, body: body)
+                mappedError: errors.http(
+                    status: response.statusCode,
+                    body: Self.boundedErrorBody(response.data)
+                )
             )
         }
 
@@ -390,6 +392,8 @@ public struct PaginatedRESTClient {
             )
         } catch let DecodingError.dataCorrupted(ctx) {
             throw errors.decode("corrupted at \(pathString(ctx.codingPath)): \(ctx.debugDescription)")
+        } catch is CancellationError { throw CancellationError() } catch {
+            throw errors.decode(Self.boundedDecodeDetail(error))
         }
     }
 
@@ -481,6 +485,53 @@ public struct PaginatedRESTClient {
     }
 }
 
+extension PaginatedRESTClient {
+    nonisolated static var maxMappedErrorBodyBytes: Int { 4 * 1_024 }
+    nonisolated static var maxMappedErrorBodyScalars: Int { 1_024 }
+
+    nonisolated static func boundedErrorBody(_ data: Data) -> String {
+        let prefix = data.prefix(maxMappedErrorBodyBytes)
+        // Lossy decoding is deliberate: invalid bytes become a bounded replacement
+        // scalar instead of making the mapped error body disappear.
+        // swiftlint:disable:next optional_data_string_conversion
+        let decoded = String(decoding: [UInt8](prefix), as: UTF8.self)
+        return sanitizedText(
+            decoded,
+            maxScalars: maxMappedErrorBodyScalars,
+            truncated: data.count > maxMappedErrorBodyBytes
+        )
+    }
+
+    nonisolated static func boundedDecodeDetail(_ error: any Error) -> String {
+        sanitizedText(
+            "decode failed (\(type(of: error))): \(error.localizedDescription)",
+            maxScalars: 512,
+            truncated: false
+        )
+    }
+
+    private nonisolated static func sanitizedText(
+        _ text: String,
+        maxScalars: Int,
+        truncated: Bool
+    ) -> String {
+        var result = String.UnicodeScalarView()
+        var scalarTruncated = false
+        for scalar in text.unicodeScalars {
+            guard result.count < maxScalars else { scalarTruncated = true; break }
+            switch scalar.properties.generalCategory {
+            case .control, .format, .privateUse, .surrogate, .unassigned:
+                result.append("�")
+            default:
+                result.append(scalar)
+            }
+        }
+        var string = String(result)
+        if truncated || scalarTruncated { string += " [truncated]" }
+        return string
+    }
+}
+
 public extension PaginatedRESTClient {
     nonisolated func authorizedGET(_ url: URL) -> RESTRequest {
         RESTRequest(
@@ -496,10 +547,12 @@ public extension PaginatedRESTClient {
         do {
             let response = try await transportResponse(for: request)
             guard (200 ..< 300).contains(response.statusCode) else {
-                let body = String(data: response.data, encoding: .utf8) ?? ""
                 throw HTTPAttemptFailure(
                     response: response,
-                    mappedError: errors.http(status: response.statusCode, body: body)
+                    mappedError: errors.http(
+                        status: response.statusCode,
+                        body: Self.boundedErrorBody(response.data)
+                    )
                 )
             }
         } catch let failure as HTTPAttemptFailure {

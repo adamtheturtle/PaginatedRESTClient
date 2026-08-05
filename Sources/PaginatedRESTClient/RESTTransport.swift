@@ -68,13 +68,26 @@ public nonisolated struct RESTResponse: Sendable {
     public init(data: Data, statusCode: Int, headers: [String: String] = [:]) {
         self.data = data
         self.statusCode = statusCode
-        self.headers = headers
+        self.headers = Self.canonicalized(headers)
     }
 
     /// Returns a response header without requiring callers or transports to agree on
     /// capitalization (for example, `Retry-After` versus `retry-after`).
     public func value(forHTTPHeaderField field: String) -> String? {
-        headers.first { $0.key.compare(field, options: .caseInsensitive) == .orderedSame }?.value
+        let values = headers
+            .filter { $0.key.compare(field, options: .caseInsensitive) == .orderedSame }
+            .sorted { $0.key.utf8.lexicographicallyPrecedes($1.key.utf8) }
+            .map(\.value)
+        return values.isEmpty ? nil : values.joined(separator: ", ")
+    }
+
+    private static func canonicalized(_ headers: [String: String]) -> [String: String] {
+        headers
+            .sorted { $0.key.utf8.lexicographicallyPrecedes($1.key.utf8) }
+            .reduce(into: [:]) { result, field in
+                let name = field.key.lowercased()
+                result[name] = [result[name], field.value].compactMap { $0 }.joined(separator: ", ")
+            }
     }
 }
 
