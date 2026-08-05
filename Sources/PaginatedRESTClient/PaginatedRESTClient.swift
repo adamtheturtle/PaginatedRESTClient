@@ -174,6 +174,10 @@ public struct PaginatedRESTClient {
     /// response could otherwise overflow `total + pageSize - 1` and trap the process.
     nonisolated static let maxReportedTotal = 100_000_000
 
+    /// Retry delays, including server-provided `Retry-After` values, never block the
+    /// shared client for longer than one minute.
+    nonisolated static let maxRetryDelay: TimeInterval = 60
+
     public init(
         apiKey: String,
         baseURL: URL,
@@ -236,8 +240,9 @@ public struct PaginatedRESTClient {
         return items
     }
 
-    /// Streams cumulative snapshots of a paginated list endpoint, yielding page 1 first so
-    /// callers can render before the whole list is in.
+    /// Streams cumulative snapshots of a paginated list endpoint. The one-element newest
+    /// buffer lets callers render before the whole list is in without retaining a quadratic
+    /// queue of growing arrays; a slow consumer may skip intermediate cumulative snapshots.
     ///
     /// When the first response reports a `total`, the page count is known up front and the
     /// remaining pages (numbered `?page=2…N`) are fetched concurrently - turning what was a
@@ -252,7 +257,7 @@ public struct PaginatedRESTClient {
         path: String,
         sort: String? = nil
     ) -> AsyncThrowingStream<[W.Item], Error> {
-        AsyncThrowingStream { continuation in
+        AsyncThrowingStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
             // This method is `nonisolated`, and so is the networking it calls, so this
             // unstructured `Task` does not inherit the module's default main-actor
             // isolation - the pipeline, including the concurrent child tasks below,
@@ -285,6 +290,11 @@ public struct PaginatedRESTClient {
         request: RESTRequest,
         maxAttempts: Int = 3
     ) async throws -> T {
+        guard maxAttempts > 0 else { throw errors.decode("maxAttempts must be positive") }
+        guard Self.methodIsIdempotent(request.method) else {
+            return try await perform(type, request: request)
+        }
+
         var attempt = 0
         while true {
             do {
@@ -293,20 +303,19 @@ public struct PaginatedRESTClient {
                 attempt += 1
 
                 if failure.response.statusCode == 429 {
+                    guard attempt < maxAttempts, errors.isTransient(failure.mappedError) else {
+                        throw failure.mappedError
+                    }
                     let now = retryRuntime.now()
                     let retryAfter = Self.retryAfterDelay(
                         failure.response.value(forHTTPHeaderField: "Retry-After"),
                         relativeTo: now
                     )
-                    let delay = retryAfter ?? Self.rateLimitFallbackDelay(
+                    let delay = min(Self.maxRetryDelay, retryAfter ?? Self.rateLimitFallbackDelay(
                         retryNumber: attempt,
                         jitter: retryRuntime.jitter()
-                    )
+                    ))
                     rateLimitCooldown.extend(until: now.addingTimeInterval(delay))
-
-                    guard attempt < maxAttempts, errors.isTransient(failure.mappedError) else {
-                        throw failure.mappedError
-                    }
                     log("Rate limited on \(request.url.path); retry \(attempt)/\(maxAttempts - 1) "
                         + "after shared \(String(format: "%.3f", delay))s cooldown")
                     try await waitForRateLimitCooldown()
@@ -317,7 +326,7 @@ public struct PaginatedRESTClient {
                     throw failure.mappedError
                 }
                 log("Transient failure on \(request.url.path); retry \(attempt)/\(maxAttempts - 1)")
-                try await retryRuntime.sleep(0.3 * pow(2, Double(attempt - 1)))
+                try await retryRuntime.sleep(Self.retryBackoffDelay(retryNumber: attempt))
             } catch {
                 attempt += 1
                 guard attempt < maxAttempts, errors.isTransient(error) else { throw error }
@@ -325,7 +334,7 @@ public struct PaginatedRESTClient {
                 log("Transient failure on \(request.url.path); retry \(attempt)/\(maxAttempts - 1)")
                 // Preserve the existing 300ms, then 600ms exponential policy for
                 // non-HTTP transient errors. The injected sleep remains cancellable.
-                try await retryRuntime.sleep(0.3 * pow(2, Double(attempt - 1)))
+                try await retryRuntime.sleep(Self.retryBackoffDelay(retryNumber: attempt))
             }
         }
     }
@@ -530,6 +539,15 @@ extension PaginatedRESTClient {
         if truncated || scalarTruncated { string += " [truncated]" }
         return string
     }
+
+    nonisolated static func retryBackoffDelay(retryNumber: Int) -> TimeInterval {
+        let exponent = Double(min(max(retryNumber - 1, 0), 10))
+        return min(maxRetryDelay, 0.3 * pow(2, exponent))
+    }
+
+    nonisolated static func methodIsIdempotent(_ method: String) -> Bool {
+        ["GET", "HEAD", "OPTIONS", "TRACE", "PUT", "DELETE"].contains(method.uppercased())
+    }
 }
 
 public extension PaginatedRESTClient {
@@ -578,14 +596,17 @@ nonisolated func drivePagination<W: PagedResponse>(
 ) async throws {
     guard !apiKey.isEmpty else { throw errors.missingAPIKey() }
 
-    let baseQuery: [URLQueryItem] = sort.map { [URLQueryItem(name: "sort", value: $0)] } ?? []
-
     /// Builds `…/path?sort=…&page=N`. Page numbers are constructed here
     /// rather than taken from `next_page` so the parallel fetch is
     /// fully deterministic.
     func pageURL(_ page: Int?) -> URL? {
         var comps = URLComponents(url: baseURL.appending(path: path), resolvingAgainstBaseURL: false)
-        var query = baseQuery
+        var query = comps?.queryItems ?? []
+        query.removeAll { $0.name.compare("page", options: .caseInsensitive) == .orderedSame }
+        if let sort {
+            query.removeAll { $0.name.compare("sort", options: .caseInsensitive) == .orderedSame }
+            query.append(URLQueryItem(name: "sort", value: sort))
+        }
         if let page { query.append(URLQueryItem(name: "page", value: String(page))) }
         comps?.queryItems = query.isEmpty ? nil : query
         return comps?.url
@@ -682,18 +703,14 @@ nonisolated func fetchKnownPages<W: PagedResponse>(
     // whole task group, discarding every record already fetched. Erring the other way
     // is harmless: a short page count just leaves a remainder for the `next_page` walk.
     let pageSize = W.pageSize
-    guard pageSize > 0 else {
-        throw errors.decode("page size must be positive, got \(pageSize)")
-    }
+    guard pageSize > 0 else { throw errors.decode("page size must be positive, got \(pageSize)") }
 
     let total = firstPage.total ?? items.count
     // `total` is decoded straight from JSON, so validate it before it reaches the
     // page-count arithmetic: `total + pageSize - 1` on `Int.max` traps the process.
-    guard total >= 0, total <= Self.maxReportedTotal else {
-        throw errors.decode("reported total (\(total)) is out of range")
-    }
+    guard total >= 0, total <= Self.maxReportedTotal else { throw errors.decode("total out of range: \(total)") }
 
-    let pageCount = max(1, (total + pageSize - 1) / pageSize)
+    let pageCount = max(1, (total / pageSize) + (total % pageSize == 0 ? 0 : 1))
     // Mirrors `maxSequentialPages`: bound the requests one list can issue, since
     // `pageCount` is derived from a server-supplied number. Surface the cap as an
     // error rather than silently truncating, exactly as the sequential walk does.
@@ -703,11 +720,10 @@ nonisolated func fetchKnownPages<W: PagedResponse>(
     }
     guard pageCount > 1 else { return firstPage.nextPage }
 
-    // Only the final page's `next_page` is worth following, and only if that page
-    // actually contributed rows. A server that clamps an out-of-range `page` returns
-    // some already-seen page whose `next_page` points back near the start of the list;
-    // following that re-walks everything. No new rows means the page was out of range,
-    // so there is no remainder to pick up.
+    // Only the final page's `next_page` is worth following. A server that clamps an
+    // out-of-range `page` returns an already-seen page whose `next_page` points back into
+    // the numbered range; `advancingTailNextPage` rejects that without confusing it with
+    // a legitimate duplicate-only page caused by concurrent list drift.
     var tailNextPage: String?
     var pending: [Int: W] = [:]
     var nextToEmit = 2
@@ -737,9 +753,17 @@ nonisolated func fetchKnownPages<W: PagedResponse>(
                     ready.pageItems, to: &collected, seen: &seen, identity: W.identity(of:)
                 )
                 // The final page's `next_page` tells us whether the estimate fell
-                // short - but only when that page was genuinely in range, i.e. it
-                // brought rows we had not already collected.
-                if nextToEmit == pageCount, added > 0 { tailNextPage = ready.nextPage }
+                // short. A duplicate-only page can still be genuinely in range after
+                // concurrent insert/delete drift, so do not require it to add rows.
+                // Reject only links that point back into the already fetched numbered
+                // range, which is how an out-of-range request clamped to page one shows
+                // up here.
+                if nextToEmit == pageCount {
+                    tailNextPage = try advancingTailNextPage(
+                        ready.nextPage,
+                        afterEstimatedPage: pageCount
+                    )
+                }
                 nextToEmit += 1
                 grew = grew || added > 0
             }
@@ -749,6 +773,19 @@ nonisolated func fetchKnownPages<W: PagedResponse>(
     }
     items = collected
     return tailNextPage
+}
+
+nonisolated func advancingTailNextPage(
+    _ value: String?,
+    afterEstimatedPage pageCount: Int
+) throws -> String? {
+    guard let value, let url = try validatedNextPageURL(value) else { return nil }
+    let pageValue = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+        .queryItems?
+        .first { $0.name.compare("page", options: .caseInsensitive) == .orderedSame }?
+        .value
+    if let pageValue, let page = Int(pageValue), page <= pageCount { return nil }
+    return value
 }
 
 nonisolated func validateParallelIdentities<W: PagedResponse>(_ page: W) throws {

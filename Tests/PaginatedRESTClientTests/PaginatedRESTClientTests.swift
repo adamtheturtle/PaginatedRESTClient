@@ -110,6 +110,18 @@ private nonisolated struct TenPerPage: PagedResponse {
     enum CodingKeys: String, CodingKey { case things; case nextPage = "next_page"; case total }
 }
 
+private nonisolated struct HugePageSize: PagedResponse {
+    let things: [Thing]
+    let nextPage: String?
+    let total: Int?
+    var pageItems: [Thing] { things }
+
+    nonisolated static var pageSize: Int { .max }
+    nonisolated static func identity(of item: Thing) -> AnyHashable? { item.id }
+
+    enum CodingKeys: String, CodingKey { case things; case nextPage = "next_page"; case total }
+}
+
 /// Supplies identities on page one but deliberately withholds one on page two, which
 /// must invalidate the speculative parallel path before that page is emitted.
 private nonisolated struct PartialIdentityPage: PagedResponse {
@@ -317,6 +329,15 @@ private struct StubTransport: RESTTransport {
     }
 }
 
+private nonisolated struct QueryCaptureTransport: RESTTransport {
+    let captured: CapturedRequests
+
+    func data(for request: RESTRequest) async throws -> (Data, Int) {
+        _ = captured.append(request)
+        return try await StubTransport().data(for: request)
+    }
+}
+
 private nonisolated struct FixedResponseTransport: RESTTransport {
     let data: Data
     let status: Int
@@ -409,6 +430,50 @@ private nonisolated final class RetryOnceTransport: RESTTransport, @unchecked Se
     }
 }
 
+private nonisolated final class CountingStatusTransport: RESTTransport, @unchecked Sendable {
+    private let lock = NSLock()
+    private var attempts = 0
+    let status: Int
+
+    init(status: Int) {
+        self.status = status
+    }
+
+    func data(for _: RESTRequest) async throws -> (Data, Int) {
+        lock.withLock { attempts += 1 }
+        let body = status == 200 ? #"{"id":1}"# : "failure"
+        return (Data(body.utf8), status)
+    }
+
+    var requestCount: Int { lock.withLock { attempts } }
+}
+
+private nonisolated final class TerminalRateLimitTransport: RESTTransport, @unchecked Sendable {
+    private let lock = NSLock()
+    private var paths: [String] = []
+
+    func response(for request: RESTRequest) async throws -> RESTResponse {
+        lock.withLock { paths.append(request.url.path) }
+        if request.url.path == "/limited" {
+            return RESTResponse(
+                data: Data("limited".utf8),
+                statusCode: 429,
+                headers: ["Retry-After": "600"]
+            )
+        }
+        return RESTResponse(data: Data(#"{"id":1}"#.utf8), statusCode: 200)
+    }
+
+    func data(for request: RESTRequest) async throws -> (Data, Int) {
+        let response = try await response(for: request)
+        return (response.data, response.statusCode)
+    }
+
+    func requestCount(path: String) -> Int {
+        lock.withLock { paths.count(where: { $0 == path }) }
+    }
+}
+
 /// Makes pages 2 and 3 reach their first 429 together, then serves both successfully.
 /// The barrier prevents scheduler order from weakening the shared-cooldown assertion.
 private nonisolated final class ConcurrentRateLimitTransport: RESTTransport, @unchecked Sendable {
@@ -465,11 +530,12 @@ private nonisolated final class ConcurrentRateLimitTransport: RESTTransport, @un
 
 private func makeClient(
     transport: any RESTTransport = StubTransport(),
+    baseURL: URL = URL(string: "https://example.test")!,
     retryRuntime: RetryRuntime = .live
 ) -> PaginatedRESTClient {
     PaginatedRESTClient(
         apiKey: "test-key",
-        baseURL: URL(string: "https://example.test")!,
+        baseURL: baseURL,
         transport: transport,
         decoderFactory: { JSONDecoder() },
         encoderFactory: { JSONEncoder() },
@@ -558,6 +624,51 @@ struct PaginatedRESTClientTests {
         // First snapshot is page 1 alone; the last is the complete, ordered list.
         #expect(snapshots.first == [Thing(id: 1), Thing(id: 2)])
         #expect(snapshots.last == [Thing(id: 1), Thing(id: 2), Thing(id: 3)])
+    }
+
+    @Test
+    func `a slow stream consumer retains only the newest cumulative snapshot`() async throws {
+        let pages = stride(from: 1, through: 1_000, by: 10).map { Array($0 ... ($0 + 9)) }
+        let log = RequestLog()
+        let stream = makeClient(transport: ScriptedTransport(
+            pages: pages,
+            total: 1_000,
+            outOfRange: .notFound,
+            log: log
+        )).streamAllPages(TenPerPage.self, path: "/things/")
+
+        while log.requestedPages.count < 100 { await Task.yield() }
+        try await Task.sleep(for: .milliseconds(50))
+        var snapshots: [[Thing]] = []
+        for try await snapshot in stream { snapshots.append(snapshot) }
+
+        #expect(snapshots == [things(1 ... 1_000)])
+    }
+
+    @Test
+    func `base URL query items survive first and numbered page construction`() async throws {
+        let captured = CapturedRequests()
+        let baseURL = try #require(URL(string:
+            "https://example.test/api?tenant=acme&version=2&page=99&sort=old"
+        ))
+
+        _ = try await makeClient(
+            transport: QueryCaptureTransport(captured: captured),
+            baseURL: baseURL
+        ).fetchAllPages(ThingsPage.self, path: "/things/", sort: "new")
+
+        #expect(captured.values.count == 2)
+        for request in captured.values {
+            let query = try #require(URLComponents(
+                url: request.url,
+                resolvingAgainstBaseURL: false
+            )?.queryItems)
+            #expect(query.filter { $0.name == "tenant" }.map(\.value) == ["acme"])
+            #expect(query.filter { $0.name == "version" }.map(\.value) == ["2"])
+            #expect(query.filter { $0.name == "sort" }.map(\.value) == ["new"])
+        }
+        #expect(captured.values.first?.url.query?.contains("page=") == false)
+        #expect(captured.values.last?.url.query?.contains("page=2") == true)
     }
 
     @Test
@@ -728,6 +839,38 @@ struct PaginatedRESTClientTests {
 @Suite("Rate-limit retry policy")
 struct RateLimitRetryTests {
     @Test
+    func `nonpositive attempts issue no request`() async throws {
+        let transport = CountingStatusTransport(status: 200)
+        let client = makeClient(transport: transport)
+        let request = client.authorizedGET(try #require(URL(string: "https://example.test/things/1")))
+
+        await #expect(throws: TestErrors.Failure.decode) {
+            _ = try await client.performWithRetry(Thing.self, request: request, maxAttempts: 0)
+        }
+        #expect(transport.requestCount == 0)
+    }
+
+    @Test
+    func `non-idempotent requests are never retried`() async throws {
+        let transport = CountingStatusTransport(status: 500)
+        let client = makeClient(transport: transport)
+        let request = RESTRequest(
+            url: try #require(URL(string: "https://example.test/mutation")),
+            method: "POST"
+        )
+
+        await #expect(throws: TestErrors.Failure.http(500)) {
+            _ = try await client.performWithRetry(Thing.self, request: request, maxAttempts: 3)
+        }
+        #expect(transport.requestCount == 1)
+    }
+
+    @Test
+    func `retry backoff remains finite for extreme attempt counts`() {
+        #expect(PaginatedRESTClient.retryBackoffDelay(retryNumber: .max) == 60)
+    }
+
+    @Test
     func `retry-after parses delta seconds and HTTP dates`() throws {
         var components = DateComponents()
         components.calendar = Calendar(identifier: .gregorian)
@@ -812,6 +955,61 @@ struct RateLimitRetryTests {
 
         #expect(try await task.value == Thing(id: 1))
         #expect(transport.requestCount == 2)
+    }
+
+    @Test
+    func `an extreme Retry-After value is capped`() async throws {
+        let clock = TestClock()
+        let sleeper = ControlledSleeper()
+        let transport = RetryOnceTransport(retryAfter: "999999999")
+        let client = makeClient(
+            transport: transport,
+            retryRuntime: RetryRuntime(
+                now: { clock.now },
+                sleep: { try await sleeper.sleep(for: $0) },
+                jitter: { 0 }
+            )
+        )
+        let request = client.authorizedGET(try #require(URL(string: "https://example.test/things/1")))
+        let task = Task { try await client.performWithRetry(Thing.self, request: request) }
+
+        while sleeper.requestedDelays.isEmpty { await Task.yield() }
+        #expect(sleeper.requestedDelays == [60])
+        clock.advance(by: 60)
+        sleeper.resumeAll()
+
+        #expect(try await task.value == Thing(id: 1))
+    }
+
+    @Test
+    func `a terminal rate limit does not delay a later request`() async throws {
+        let clock = TestClock()
+        let sleeper = ControlledSleeper()
+        let transport = TerminalRateLimitTransport()
+        let client = makeClient(
+            transport: transport,
+            retryRuntime: RetryRuntime(
+                now: { clock.now },
+                sleep: { try await sleeper.sleep(for: $0) },
+                jitter: { 0 }
+            )
+        )
+        let limited = client.authorizedGET(try #require(URL(string: "https://example.test/limited")))
+        await #expect(throws: TestErrors.Failure.http(429)) {
+            _ = try await client.performWithRetry(Thing.self, request: limited, maxAttempts: 1)
+        }
+
+        let next = client.authorizedGET(try #require(URL(string: "https://example.test/next")))
+        let task = Task { try await client.performWithRetry(Thing.self, request: next, maxAttempts: 1) }
+        while transport.requestCount(path: "/next") == 0, sleeper.requestedDelays.isEmpty {
+            await Task.yield()
+        }
+        #expect(sleeper.requestedDelays.isEmpty)
+        if !sleeper.requestedDelays.isEmpty {
+            clock.advance(by: 60)
+            sleeper.resumeAll()
+        }
+        #expect(try await task.value == Thing(id: 1))
     }
 
     @Test
@@ -920,6 +1118,23 @@ struct PageCountTests {
         #expect(log.requestedPages.sorted() == [1, 2, 3])
     }
 
+    @Test
+    func `a duplicate-only estimated tail still follows a forward next page`() async throws {
+        let log = RequestLog()
+        let transport = ScriptedTransport(
+            pages: [Array(1 ... 10), Array(11 ... 20), Array(11 ... 20), Array(21 ... 25)],
+            total: 30,
+            outOfRange: .notFound,
+            log: log
+        )
+
+        let items = try await makeClient(transport: transport)
+            .fetchAllPages(TenPerPage.self, path: "/things/")
+
+        #expect(items == things(1 ... 25))
+        #expect(log.requestedPages.sorted() == [1, 2, 3, 4])
+    }
+
     /// `pageCount` derives from a server-supplied `total`, so it needs the same valve the
     /// sequential walk has - otherwise one bogus `total` amplifies into thousands of
     /// requests for a handful of records.
@@ -951,6 +1166,16 @@ struct PageCountTests {
             _ = try await makeClient(transport: FixedFirstPageTransport(json: json))
                 .fetchAllPages(TenPerPage.self, path: "/things/")
         }
+    }
+
+    @Test
+    func `an enormous page size cannot overflow page count arithmetic`() async throws {
+        let json = #"{"things":[{"id":1}],"next_page":null,"total":2}"#
+
+        let items = try await makeClient(transport: FixedFirstPageTransport(json: json))
+            .fetchAllPages(HugePageSize.self, path: "/things/")
+
+        #expect(items == [Thing(id: 1)])
     }
 }
 
