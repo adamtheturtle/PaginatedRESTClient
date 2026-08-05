@@ -541,6 +541,7 @@ nonisolated func drivePagination<W: PagedResponse>(
     guard let firstURL = pageURL(nil) else { throw errors.http(status: 0, body: "Invalid URL") }
 
     let firstPage = try await performWithRetry(W.self, request: authorizedGET(firstURL))
+    var visitedPageURLs: Set<URL> = [canonicalPageURL(firstURL)]
     // `seen` de-dupes by each item's stable identity across every page, so an
     // over-requested page that echoes page 1 can't duplicate rows.
     var seen = Set<AnyHashable>()
@@ -562,12 +563,26 @@ nonisolated func drivePagination<W: PagedResponse>(
         let tailNextPage = try await fetchKnownPages(
             W.self, firstPage: firstPage, items: &items, seen: &seen, pageURL: pageURL, emit: emit
         )
-        try await walkNextPages(W.self, from: tailNextPage, items: &items, seen: &seen, emit: emit)
+        try await walkNextPages(
+            W.self,
+            from: tailNextPage,
+            items: &items,
+            seen: &seen,
+            visitedPageURLs: &visitedPageURLs,
+            emit: emit
+        )
         return
     }
 
     // Fallback: follow `next_page` one page at a time.
-    try await walkNextPages(W.self, from: firstPage.nextPage, items: &items, seen: &seen, emit: emit)
+    try await walkNextPages(
+        W.self,
+        from: firstPage.nextPage,
+        items: &items,
+        seen: &seen,
+        visitedPageURLs: &visitedPageURLs,
+        emit: emit
+    )
 }
 
 /// Appends only items not already seen (by their `PagedResponse` identity), updating
@@ -689,11 +704,16 @@ nonisolated func walkNextPages<W: PagedResponse>(
     from start: String?,
     items: inout [W.Item],
     seen: inout Set<AnyHashable>,
+    visitedPageURLs: inout Set<URL>,
     emit: ([W.Item]) -> Void
 ) async throws {
     var url = try start.flatMap { try validatedNextPageURL($0) }
     var pages = 0
     while let current = url {
+        guard visitedPageURLs.insert(canonicalPageURL(current)).inserted else {
+            throw errors.http(status: 0, body: "Pagination next_page cycle detected")
+        }
+
         let page = try await performWithRetry(W.self, request: authorizedGET(current))
         Self.appendNew(page.pageItems, to: &items, seen: &seen, identity: W.identity(of:))
         emit(items)
@@ -742,11 +762,29 @@ nonisolated func validatedNextPageURL(_ value: String) throws -> URL? {
 }
 
 nonisolated func effectivePort(_ components: URLComponents) -> Int? {
-    if let port = components.port { return port }
-    return switch components.scheme?.lowercased() {
+    components.port ?? defaultPort(for: components.scheme)
+}
+
+nonisolated func defaultPort(for scheme: String?) -> Int? {
+    switch scheme?.lowercased() {
     case "http": 80
     case "https": 443
     default: nil
     }
+}
+
+/// Produces the identity used for cycle detection. URL fragments never reach an HTTP
+/// server, and origin spelling differences must not let the same page evade the guard.
+nonisolated func canonicalPageURL(_ url: URL) -> URL {
+    let standardized = url.standardized
+    guard var components = URLComponents(url: standardized, resolvingAgainstBaseURL: false) else {
+        return standardized
+    }
+
+    components.scheme = components.scheme?.lowercased()
+    components.host = components.host?.lowercased()
+    if components.port == defaultPort(for: components.scheme) { components.port = nil }
+    components.fragment = nil
+    return components.url?.standardized ?? standardized
 }
 }

@@ -227,6 +227,35 @@ private nonisolated struct NextPageTransport: RESTTransport {
     }
 }
 
+private nonisolated struct CycleTransport: RESTTransport {
+    enum Kind: Sendable {
+        case selfLoop
+        case twoPages
+    }
+
+    let kind: Kind
+    let captured: CapturedRequests
+
+    func data(for request: RESTRequest) async throws -> (Data, Int) {
+        _ = captured.append(request)
+        let page = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?
+            .queryItems?.first { $0.name == "page" }?.value
+        let id = page == "2" ? 2 : 1
+        let nextPage = switch (kind, page) {
+        case (.selfLoop, _), (.twoPages, "2"):
+            "https://EXAMPLE.test:443/things/#fragment"
+        case (.twoPages, _):
+            "/things/?page=2"
+        }
+        let data = try JSONSerialization.data(withJSONObject: [
+            "things": [["id": id]],
+            "next_page": nextPage,
+            "total": NSNull()
+        ])
+        return (data, 200)
+    }
+}
+
 /// Serves a fixed two-page fixture keyed off the `page` query item, with no real
 /// networking - a `RESTTransport` stub in place of the old `URLProtocol`/`URLSession`
 /// machinery, so the tests exercise the paginator over the same seam consumers use and
@@ -528,6 +557,38 @@ struct PaginatedRESTClientTests {
         }
 
         #expect(captured.values.count == 2)
+    }
+
+    @Test
+    func `a canonical self loop fails before repeating its request or rows`() async throws {
+        let captured = CapturedRequests()
+        let client = makeClient(transport: CycleTransport(kind: .selfLoop, captured: captured))
+        var snapshots: [[Thing]] = []
+
+        await #expect(throws: TestErrors.Failure.http(0)) {
+            for try await snapshot in client.streamAllPages(Unidentified.self, path: "/things/") {
+                snapshots.append(snapshot)
+            }
+        }
+
+        #expect(captured.values.count == 1)
+        #expect(snapshots == [[Thing(id: 1)]])
+    }
+
+    @Test
+    func `a two-page cycle fails before repeating its request or rows`() async throws {
+        let captured = CapturedRequests()
+        let client = makeClient(transport: CycleTransport(kind: .twoPages, captured: captured))
+        var snapshots: [[Thing]] = []
+
+        await #expect(throws: TestErrors.Failure.http(0)) {
+            for try await snapshot in client.streamAllPages(Unidentified.self, path: "/things/") {
+                snapshots.append(snapshot)
+            }
+        }
+
+        #expect(captured.values.count == 2)
+        #expect(snapshots == [[Thing(id: 1)], [Thing(id: 1), Thing(id: 2)]])
     }
 
     @Test
