@@ -205,7 +205,7 @@ public struct PaginatedRESTClient {
         log: @escaping @Sendable (String) -> Void = { _ in },
         retryRuntime: RetryRuntime
     ) {
-        self.apiKey = apiKey
+        self.apiKey = Self.normalizedAPIKey(apiKey) ?? ""
         self.baseURL = baseURL
         self.transport = transport
         self.decoderFactory = decoderFactory
@@ -219,7 +219,7 @@ public struct PaginatedRESTClient {
     public nonisolated func fetch<T: Decodable & Sendable>(_ type: T.Type, path: String) async throws -> T {
         guard !apiKey.isEmpty else { throw errors.missingAPIKey() }
 
-        return try await performWithRetry(type, request: authorizedGET(baseURL.appending(path: path)))
+        return try await performWithRetry(type, request: try authorizedGET(baseURL.appending(path: path)))
     }
 
     /// Accumulates every page of a paginated list endpoint. Convenience over
@@ -482,8 +482,18 @@ public struct PaginatedRESTClient {
 }
 
 public extension PaginatedRESTClient {
-    nonisolated func authorizedGET(_ url: URL) -> RESTRequest {
-        RESTRequest(
+    /// Builds an authenticated GET only for the configured origin. This method throws
+    /// rather than placing bearer credentials on an arbitrary caller-provided URL.
+    nonisolated func authorizedGET(_ url: URL) throws -> RESTRequest {
+        guard !apiKey.isEmpty else { throw errors.missingAPIKey() }
+        guard SameOriginRedirectDelegate.hasSameOrigin(baseURL, url),
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              components.user == nil,
+              components.password == nil
+        else {
+            throw errors.http(status: 0, body: "Authenticated URL left the configured origin")
+        }
+        return RESTRequest(
             url: url,
             method: "GET",
             headers: ["Authorization": "Bearer \(apiKey)", "Accept": "application/json"]
@@ -505,6 +515,16 @@ public extension PaginatedRESTClient {
         } catch let failure as HTTPAttemptFailure {
             throw failure.mappedError
         }
+    }
+}
+
+extension PaginatedRESTClient {
+    nonisolated static func normalizedAPIKey(_ value: String) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              trimmed.utf8.allSatisfy({ (0x21 ... 0x7E).contains($0) })
+        else { return nil }
+        return trimmed
     }
 }
 
@@ -540,7 +560,7 @@ nonisolated func drivePagination<W: PagedResponse>(
 
     guard let firstURL = pageURL(nil) else { throw errors.http(status: 0, body: "Invalid URL") }
 
-    let firstPage = try await performWithRetry(W.self, request: authorizedGET(firstURL))
+    let firstPage = try await performWithRetry(W.self, request: try authorizedGET(firstURL))
     var visitedPageURLs: Set<URL> = [canonicalPageURL(firstURL)]
     // `seen` de-dupes by each item's stable identity across every page, so an
     // over-requested page that echoes page 1 can't duplicate rows.
@@ -664,7 +684,7 @@ nonisolated func fetchKnownPages<W: PagedResponse>(
             guard let url = pageURL(page) else { throw errors.http(status: 0, body: "Invalid URL") }
 
             group.addTask {
-                try await (page, performWithRetry(W.self, request: authorizedGET(url)))
+                try await (page, performWithRetry(W.self, request: try authorizedGET(url)))
             }
         }
         // Keep a bounded window in flight - enough to saturate the network without
@@ -721,7 +741,7 @@ nonisolated func walkNextPages<W: PagedResponse>(
             throw errors.http(status: 0, body: "Pagination next_page cycle detected")
         }
 
-        let page = try await performWithRetry(W.self, request: authorizedGET(current))
+        let page = try await performWithRetry(W.self, request: try authorizedGET(current))
         Self.appendNew(page.pageItems, to: &items, seen: &seen, identity: W.identity(of:))
         emit(items)
         pages += 1

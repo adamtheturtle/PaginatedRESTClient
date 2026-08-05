@@ -490,12 +490,54 @@ struct PaginatedRESTClientTests {
         }
     }
 
+    @Test(arguments: ["   ", "\n\t", "key\nsecond", "key\u{7F}"])
+    func `invalid bearer keys cannot build authorized requests`(apiKey: String) async throws {
+        let client = PaginatedRESTClient(
+            apiKey: apiKey,
+            baseURL: try #require(URL(string: "https://example.test")),
+            transport: StubTransport(),
+            decoderFactory: { JSONDecoder() },
+            encoderFactory: { JSONEncoder() },
+            errors: TestErrors()
+        )
+
+        #expect(throws: TestErrors.Failure.missingAPIKey) {
+            _ = try client.authorizedGET(#require(URL(string: "https://example.test/things/1")))
+        }
+    }
+
+    @Test
+    func `bearer keys are trimmed before use`() throws {
+        let client = PaginatedRESTClient(
+            apiKey: "  test-key\n",
+            baseURL: try #require(URL(string: "https://example.test")),
+            decoderFactory: { JSONDecoder() },
+            encoderFactory: { JSONEncoder() },
+            errors: TestErrors()
+        )
+
+        let request = try client.authorizedGET(#require(URL(string: "https://example.test/things/1")))
+        #expect(request.headers["Authorization"] == "Bearer test-key")
+    }
+
     @Test
     func `the paginator authorizes requests with a bearer token`() async throws {
-        let request = makeClient().authorizedGET(try #require(URL(string: "https://example.test/things/")))
+        let request = try makeClient().authorizedGET(#require(URL(string: "https://example.test/things/")))
         #expect(request.method == "GET")
         #expect(request.headers["Authorization"] == "Bearer test-key")
         #expect(request.headers["Accept"] == "application/json")
+    }
+
+    @Test(arguments: [
+        "https://attacker.test/things/",
+        "http://example.test/things/",
+        "https://example.test:444/things/",
+        "https://user@example.test/things/"
+    ])
+    func `public authorization rejects URLs outside the configured origin`(value: String) throws {
+        #expect(throws: TestErrors.Failure.http(0)) {
+            _ = try makeClient().authorizedGET(#require(URL(string: value)))
+        }
     }
 
     @Test(arguments: [
@@ -624,7 +666,7 @@ struct PaginatedRESTClientTests {
     @Test(arguments: [(204, ""), (200, #"{"status":"ok"}"#)])
     func `no-content execution accepts empty and JSON success bodies`(status: Int, body: String) async throws {
         let client = makeClient(transport: FixedResponseTransport(data: Data(body.utf8), status: status))
-        let request = client.authorizedGET(try #require(URL(string: "https://example.test/mutation")))
+        let request = try client.authorizedGET(#require(URL(string: "https://example.test/mutation")))
 
         try await client.performNoContent(request: request)
     }
@@ -632,7 +674,7 @@ struct PaginatedRESTClientTests {
     @Test
     func `no-content execution retains mapped HTTP failures`() async throws {
         let client = makeClient(transport: FixedResponseTransport(data: Data("conflict".utf8), status: 409))
-        let request = client.authorizedGET(try #require(URL(string: "https://example.test/mutation")))
+        let request = try client.authorizedGET(#require(URL(string: "https://example.test/mutation")))
 
         await #expect(throws: TestErrors.Failure.http(409)) {
             try await client.performNoContent(request: request)
@@ -691,7 +733,7 @@ struct RateLimitRetryTests {
                 jitter: { 0 }
             )
         )
-        let request = client.authorizedGET(try #require(URL(string: "https://example.test/things/1")))
+        let request = try client.authorizedGET(#require(URL(string: "https://example.test/things/1")))
         let task = Task { try await client.performWithRetry(Thing.self, request: request) }
 
         while sleeper.requestedDelays.isEmpty { await Task.yield() }
@@ -717,7 +759,7 @@ struct RateLimitRetryTests {
                 jitter: { 0.5 }
             )
         )
-        let request = client.authorizedGET(try #require(URL(string: "https://example.test/things/1")))
+        let request = try client.authorizedGET(#require(URL(string: "https://example.test/things/1")))
         let task = Task { try await client.performWithRetry(Thing.self, request: request) }
 
         while sleeper.requestedDelays.isEmpty { await Task.yield() }
@@ -733,7 +775,7 @@ struct RateLimitRetryTests {
     func `cancellation interrupts a Retry-After wait without another request`() async throws {
         let transport = RetryOnceTransport(retryAfter: "3600")
         let client = makeClient(transport: transport)
-        let request = client.authorizedGET(try #require(URL(string: "https://example.test/things/1")))
+        let request = try client.authorizedGET(#require(URL(string: "https://example.test/things/1")))
         let task = Task { try await client.performWithRetry(Thing.self, request: request) }
 
         while transport.requestCount == 0 { await Task.yield() }
