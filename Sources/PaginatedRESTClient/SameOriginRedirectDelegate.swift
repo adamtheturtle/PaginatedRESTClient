@@ -19,11 +19,44 @@ final nonisolated class SameOriginRedirectDelegate: NSObject, URLSessionTaskDele
     }
 
     private let requestOrigin: Origin?
+    private let sessionDelegate: (any URLSessionDelegate)?
     private let forwardingDelegate: (any URLSessionTaskDelegate)?
 
-    init(requestURL: URL?, forwardingDelegate: (any URLSessionTaskDelegate)?) {
+    init(requestURL: URL?, forwardingDelegate: (any URLSessionDelegate)?) {
         requestOrigin = Self.origin(from: requestURL)
-        self.forwardingDelegate = forwardingDelegate
+        sessionDelegate = forwardingDelegate
+        self.forwardingDelegate = forwardingDelegate as? any URLSessionTaskDelegate
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping @Sendable (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        guard let sessionDelegate else {
+            completionHandler(.performDefaultHandling, nil)
+            return
+        }
+        #if canImport(FoundationNetworking)
+        sessionDelegate.urlSession(session, didReceive: challenge, completionHandler: completionHandler)
+        #else
+        let forwarded: Void? = sessionDelegate.urlSession?(
+            session,
+            didReceive: challenge,
+            completionHandler: completionHandler
+        )
+        if forwarded == nil {
+            completionHandler(.performDefaultHandling, nil)
+        }
+        #endif
+    }
+
+    func urlSession(_ session: URLSession, didBecomeInvalidWithError error: (any Error)?) {
+        #if canImport(FoundationNetworking)
+        sessionDelegate?.urlSession(session, didBecomeInvalidWithError: error)
+        #else
+        sessionDelegate?.urlSession?(session, didBecomeInvalidWithError: error)
+        #endif
     }
 
     func urlSession(

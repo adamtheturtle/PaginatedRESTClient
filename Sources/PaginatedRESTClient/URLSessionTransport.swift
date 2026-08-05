@@ -54,7 +54,7 @@ public struct URLSessionTransport: RESTTransport {
         #else
         let redirectDelegate = SameOriginRedirectDelegate(
             requestURL: urlRequest.url,
-            forwardingDelegate: session.delegate as? any URLSessionTaskDelegate
+            forwardingDelegate: session.delegate
         )
         let (bytes, response) = try await session.bytes(for: urlRequest, delegate: redirectDelegate)
         guard let http = response as? HTTPURLResponse else {
@@ -144,7 +144,7 @@ private final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @
         self.errorResponseLimit = errorResponseLimit
         redirectDelegate = SameOriginRedirectDelegate(
             requestURL: requestURL,
-            forwardingDelegate: forwardingDelegate as? any URLSessionTaskDelegate
+            forwardingDelegate: forwardingDelegate
         )
         self.forwardingDelegate = forwardingDelegate
     }
