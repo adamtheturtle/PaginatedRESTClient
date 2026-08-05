@@ -86,6 +86,18 @@ private nonisolated struct TenPerPage: PagedResponse {
     enum CodingKeys: String, CodingKey { case things; case nextPage = "next_page"; case total }
 }
 
+private nonisolated struct HugePageSize: PagedResponse {
+    let things: [Thing]
+    let nextPage: String?
+    let total: Int?
+    var pageItems: [Thing] { things }
+
+    nonisolated static var pageSize: Int { .max }
+    nonisolated static func identity(of item: Thing) -> AnyHashable? { item.id }
+
+    enum CodingKeys: String, CodingKey { case things; case nextPage = "next_page"; case total }
+}
+
 /// Supplies identities on page one but deliberately withholds one on page two, which
 /// must invalidate the speculative parallel path before that page is emitted.
 private nonisolated struct PartialIdentityPage: PagedResponse {
@@ -293,6 +305,15 @@ private struct StubTransport: RESTTransport {
     }
 }
 
+private nonisolated struct QueryCaptureTransport: RESTTransport {
+    let captured: CapturedRequests
+
+    func data(for request: RESTRequest) async throws -> (Data, Int) {
+        _ = captured.append(request)
+        return try await StubTransport().data(for: request)
+    }
+}
+
 private nonisolated struct FixedResponseTransport: RESTTransport {
     let data: Data
     let status: Int
@@ -485,11 +506,12 @@ private nonisolated final class ConcurrentRateLimitTransport: RESTTransport, @un
 
 private func makeClient(
     transport: any RESTTransport = StubTransport(),
+    baseURL: URL = URL(string: "https://example.test")!,
     retryRuntime: RetryRuntime = .live
 ) -> PaginatedRESTClient {
     PaginatedRESTClient(
         apiKey: "test-key",
-        baseURL: URL(string: "https://example.test")!,
+        baseURL: baseURL,
         transport: transport,
         decoderFactory: { JSONDecoder() },
         encoderFactory: { JSONEncoder() },
@@ -517,6 +539,51 @@ struct PaginatedRESTClientTests {
         // First snapshot is page 1 alone; the last is the complete, ordered list.
         #expect(snapshots.first == [Thing(id: 1), Thing(id: 2)])
         #expect(snapshots.last == [Thing(id: 1), Thing(id: 2), Thing(id: 3)])
+    }
+
+    @Test
+    func `a slow stream consumer retains only the newest cumulative snapshot`() async throws {
+        let pages = stride(from: 1, through: 1_000, by: 10).map { Array($0 ... ($0 + 9)) }
+        let log = RequestLog()
+        let stream = makeClient(transport: ScriptedTransport(
+            pages: pages,
+            total: 1_000,
+            outOfRange: .notFound,
+            log: log
+        )).streamAllPages(TenPerPage.self, path: "/things/")
+
+        while log.requestedPages.count < 100 { await Task.yield() }
+        try await Task.sleep(for: .milliseconds(50))
+        var snapshots: [[Thing]] = []
+        for try await snapshot in stream { snapshots.append(snapshot) }
+
+        #expect(snapshots == [things(1 ... 1_000)])
+    }
+
+    @Test
+    func `base URL query items survive first and numbered page construction`() async throws {
+        let captured = CapturedRequests()
+        let baseURL = try #require(URL(string:
+            "https://example.test/api?tenant=acme&version=2&page=99&sort=old"
+        ))
+
+        _ = try await makeClient(
+            transport: QueryCaptureTransport(captured: captured),
+            baseURL: baseURL
+        ).fetchAllPages(ThingsPage.self, path: "/things/", sort: "new")
+
+        #expect(captured.values.count == 2)
+        for request in captured.values {
+            let query = try #require(URLComponents(
+                url: request.url,
+                resolvingAgainstBaseURL: false
+            )?.queryItems)
+            #expect(query.filter { $0.name == "tenant" }.map(\.value) == ["acme"])
+            #expect(query.filter { $0.name == "version" }.map(\.value) == ["2"])
+            #expect(query.filter { $0.name == "sort" }.map(\.value) == ["new"])
+        }
+        #expect(captured.values.first?.url.query?.contains("page=") == false)
+        #expect(captured.values.last?.url.query?.contains("page=2") == true)
     }
 
     @Test
@@ -966,6 +1033,23 @@ struct PageCountTests {
         #expect(log.requestedPages.sorted() == [1, 2, 3])
     }
 
+    @Test
+    func `a duplicate-only estimated tail still follows a forward next page`() async throws {
+        let log = RequestLog()
+        let transport = ScriptedTransport(
+            pages: [Array(1 ... 10), Array(11 ... 20), Array(11 ... 20), Array(21 ... 25)],
+            total: 30,
+            outOfRange: .notFound,
+            log: log
+        )
+
+        let items = try await makeClient(transport: transport)
+            .fetchAllPages(TenPerPage.self, path: "/things/")
+
+        #expect(items == things(1 ... 25))
+        #expect(log.requestedPages.sorted() == [1, 2, 3, 4])
+    }
+
     /// `pageCount` derives from a server-supplied `total`, so it needs the same valve the
     /// sequential walk has - otherwise one bogus `total` amplifies into thousands of
     /// requests for a handful of records.
@@ -997,6 +1081,16 @@ struct PageCountTests {
             _ = try await makeClient(transport: FixedFirstPageTransport(json: json))
                 .fetchAllPages(TenPerPage.self, path: "/things/")
         }
+    }
+
+    @Test
+    func `an enormous page size cannot overflow page count arithmetic`() async throws {
+        let json = #"{"things":[{"id":1}],"next_page":null,"total":2}"#
+
+        let items = try await makeClient(transport: FixedFirstPageTransport(json: json))
+            .fetchAllPages(HugePageSize.self, path: "/things/")
+
+        #expect(items == [Thing(id: 1)])
     }
 }
 
