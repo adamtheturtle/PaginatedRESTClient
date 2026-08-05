@@ -86,6 +86,23 @@ private nonisolated struct TenPerPage: PagedResponse {
     enum CodingKeys: String, CodingKey { case things; case nextPage = "next_page"; case total }
 }
 
+/// Supplies identities on page one but deliberately withholds one on page two, which
+/// must invalidate the speculative parallel path before that page is emitted.
+private nonisolated struct PartialIdentityPage: PagedResponse {
+    let things: [Thing]
+    let nextPage: String?
+    let total: Int?
+    var pageItems: [Thing] { things }
+
+    nonisolated static var pageSize: Int { 10 }
+
+    nonisolated static func identity(of item: Thing) -> AnyHashable? {
+        item.id == 11 ? nil : item.id
+    }
+
+    enum CodingKeys: String, CodingKey { case things; case nextPage = "next_page"; case total }
+}
+
 /// A conformer that does not implement `identity(of:)`, so it inherits the default `nil`
 /// identity. It declares a page size purely so that, were the parallel path taken, it
 /// would be taken with de-duplication disabled - which is the bug under test.
@@ -760,6 +777,28 @@ private func things(_ ids: ClosedRange<Int>) -> [Thing] {
 
 @Suite("Page-count estimation")
 struct PageCountTests {
+    @Test
+    func `a missing identity on page two aborts before emitting that page`() async throws {
+        let log = RequestLog()
+        let transport = ScriptedTransport(
+            pages: [Array(1 ... 10), Array(11 ... 20)],
+            total: 20,
+            outOfRange: .notFound,
+            log: log
+        )
+        let client = makeClient(transport: transport)
+        var snapshots: [[Thing]] = []
+
+        await #expect(throws: TestErrors.Failure.decode) {
+            for try await snapshot in client.streamAllPages(PartialIdentityPage.self, path: "/things/") {
+                snapshots.append(snapshot)
+            }
+        }
+
+        #expect(log.requestedPages.sorted() == [1, 2])
+        #expect(snapshots == [things(1 ... 10)])
+    }
+
     /// The page count must come from the page size the client asked for, not from the
     /// first response's item count. A first page shortened by server-side filtering makes
     /// the inferred divisor too small, over-estimating the page count and sending the
