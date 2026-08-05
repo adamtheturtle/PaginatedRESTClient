@@ -1,4 +1,4 @@
-@testable import PaginatedRESTClient
+import PaginatedRESTClient
 import Foundation
 import Testing
 
