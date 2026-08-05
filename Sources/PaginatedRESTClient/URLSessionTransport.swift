@@ -42,8 +42,13 @@ public struct URLSessionTransport: RESTTransport {
         #if os(Linux)
         return try await BoundedURLSessionLoader(
             successResponseLimit: successResponseLimit,
-            errorResponseLimit: errorResponseLimit
-        ).load(configuration: session.configuration, request: Self.urlRequest(from: request))
+            errorResponseLimit: errorResponseLimit,
+            forwardingDelegate: session.delegate
+        ).load(
+            configuration: session.configuration,
+            delegateQueue: session.delegateQueue,
+            request: Self.urlRequest(from: request)
+        )
         #else
         let (bytes, response) = try await session.bytes(for: Self.urlRequest(from: request))
         guard let http = response as? HTTPURLResponse else {
@@ -114,18 +119,28 @@ private final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @
     private var state = State()
     private let successResponseLimit: Int
     private let errorResponseLimit: Int
+    private let forwardingDelegate: (any URLSessionDelegate)?
 
-    init(successResponseLimit: Int, errorResponseLimit: Int) {
+    init(
+        successResponseLimit: Int,
+        errorResponseLimit: Int,
+        forwardingDelegate: (any URLSessionDelegate)?
+    ) {
         self.successResponseLimit = successResponseLimit
         self.errorResponseLimit = errorResponseLimit
+        self.forwardingDelegate = forwardingDelegate
     }
 
-    func load(configuration: URLSessionConfiguration, request: URLRequest) async throws -> RESTResponse {
+    func load(
+        configuration: URLSessionConfiguration,
+        delegateQueue: OperationQueue,
+        request: URLRequest
+    ) async throws -> RESTResponse {
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 let task = lock.withLock { () -> URLSessionDataTask? in
                     guard !state.cancelled else { return nil }
-                    let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+                    let session = URLSession(configuration: configuration, delegate: self, delegateQueue: delegateQueue)
                     let task = session.dataTask(with: request)
                     state.continuation = continuation
                     state.session = session
@@ -144,8 +159,8 @@ private final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @
     }
 
     func urlSession(
-        _: URLSession,
-        dataTask _: URLSessionDataTask,
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
         didReceive response: URLResponse,
         completionHandler: @escaping @Sendable (URLSession.ResponseDisposition) -> Void
     ) {
@@ -169,10 +184,16 @@ private final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @
                 state.data.reserveCapacity(Int(http.expectedContentLength))
             }
         }
-        completionHandler(.allow)
+        guard let delegate = forwardingDelegate as? any URLSessionDataDelegate else {
+            completionHandler(.allow)
+            return
+        }
+        delegate.urlSession(session, dataTask: dataTask, didReceive: response) { disposition in
+            completionHandler(disposition == .allow ? .allow : .cancel)
+        }
     }
 
-    func urlSession(_: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         let overflow = lock.withLock { () -> RESTResponseTooLargeError? in
             guard !state.completed, let response = state.response else { return nil }
             guard data.count <= state.limit - state.data.count else {
@@ -184,10 +205,15 @@ private final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @
         if let overflow {
             dataTask.cancel()
             complete(.failure(overflow))
+        } else {
+            (forwardingDelegate as? any URLSessionDataDelegate)?
+                .urlSession(session, dataTask: dataTask, didReceive: data)
         }
     }
 
-    func urlSession(_: URLSession, task _: URLSessionTask, didCompleteWithError error: (any Error)?) {
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: (any Error)?) {
+        (forwardingDelegate as? any URLSessionTaskDelegate)?
+            .urlSession(session, task: task, didCompleteWithError: error)
         if let error {
             complete(.failure(error))
             return
@@ -237,6 +263,122 @@ private final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @
         }
         resources.1?.finishTasksAndInvalidate()
         resources.0?.resume(with: result)
+    }
+}
+
+private extension BoundedURLSessionLoader {
+    func urlSession(
+        _ session: URLSession,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping @Sendable (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        guard let forwardingDelegate else {
+            completionHandler(.performDefaultHandling, nil)
+            return
+        }
+        forwardingDelegate.urlSession(session, didReceive: challenge, completionHandler: completionHandler)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping @Sendable (URLRequest?) -> Void
+    ) {
+        guard let delegate = forwardingDelegate as? any URLSessionTaskDelegate else {
+            completionHandler(request)
+            return
+        }
+        delegate.urlSession(
+            session,
+            task: task,
+            willPerformHTTPRedirection: response,
+            newRequest: request,
+            completionHandler: completionHandler
+        )
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping @Sendable (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        guard let delegate = forwardingDelegate as? any URLSessionTaskDelegate else {
+            completionHandler(.performDefaultHandling, nil)
+            return
+        }
+        delegate.urlSession(session, task: task, didReceive: challenge, completionHandler: completionHandler)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        needNewBodyStream completionHandler: @escaping @Sendable (InputStream?) -> Void
+    ) {
+        guard let delegate = forwardingDelegate as? any URLSessionTaskDelegate else {
+            completionHandler(nil)
+            return
+        }
+        delegate.urlSession(session, task: task, needNewBodyStream: completionHandler)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didSendBodyData bytesSent: Int64,
+        totalBytesSent: Int64,
+        totalBytesExpectedToSend: Int64
+    ) {
+        (forwardingDelegate as? any URLSessionTaskDelegate)?.urlSession(
+            session,
+            task: task,
+            didSendBodyData: bytesSent,
+            totalBytesSent: totalBytesSent,
+            totalBytesExpectedToSend: totalBytesExpectedToSend
+        )
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willBeginDelayedRequest request: URLRequest,
+        completionHandler: @escaping @Sendable (URLSession.DelayedRequestDisposition, URLRequest?) -> Void
+    ) {
+        guard let delegate = forwardingDelegate as? any URLSessionTaskDelegate else {
+            completionHandler(.continueLoading, nil)
+            return
+        }
+        delegate.urlSession(
+            session,
+            task: task,
+            willBeginDelayedRequest: request,
+            completionHandler: completionHandler
+        )
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics) {
+        (forwardingDelegate as? any URLSessionTaskDelegate)?
+            .urlSession(session, task: task, didFinishCollecting: metrics)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        willCacheResponse proposedResponse: CachedURLResponse,
+        completionHandler: @escaping @Sendable (CachedURLResponse?) -> Void
+    ) {
+        guard let delegate = forwardingDelegate as? any URLSessionDataDelegate else {
+            completionHandler(proposedResponse)
+            return
+        }
+        delegate.urlSession(
+            session,
+            dataTask: dataTask,
+            willCacheResponse: proposedResponse,
+            completionHandler: completionHandler
+        )
     }
 }
 #endif
