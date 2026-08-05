@@ -115,6 +115,12 @@ private final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @
         let session: URLSession?
     }
 
+    private enum DataReceipt {
+        case ignored
+        case accepted
+        case overflow(RESTResponseTooLargeError)
+    }
+
     private let lock = NSLock()
     private var state = State()
     private let successResponseLimit: Int
@@ -189,25 +195,28 @@ private final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @
             return
         }
         delegate.urlSession(session, dataTask: dataTask, didReceive: response) { disposition in
-            completionHandler(disposition == .allow ? .allow : .cancel)
+            completionHandler(disposition)
         }
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        let overflow = lock.withLock { () -> RESTResponseTooLargeError? in
-            guard !state.completed, let response = state.response else { return nil }
+        let receipt = lock.withLock { () -> DataReceipt in
+            guard !state.completed, let response = state.response else { return .ignored }
             guard data.count <= state.limit - state.data.count else {
-                return RESTResponseTooLargeError(statusCode: response.statusCode, limit: state.limit)
+                return .overflow(RESTResponseTooLargeError(statusCode: response.statusCode, limit: state.limit))
             }
             state.data.append(data)
-            return nil
+            return .accepted
         }
-        if let overflow {
-            dataTask.cancel()
-            complete(.failure(overflow))
-        } else {
+        switch receipt {
+        case .ignored:
+            break
+        case .accepted:
             (forwardingDelegate as? any URLSessionDataDelegate)?
                 .urlSession(session, dataTask: dataTask, didReceive: data)
+        case let .overflow(error):
+            dataTask.cancel()
+            complete(.failure(error))
         }
     }
 
