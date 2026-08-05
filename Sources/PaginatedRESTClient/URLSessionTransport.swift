@@ -131,7 +131,7 @@ public nonisolated struct RESTResponseTooLargeError: Error, Equatable, Sendable 
 }
 
 #if os(Linux)
-private final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private struct State {
         var continuation: CheckedContinuation<RESTResponse, any Error>?
         var session: URLSession?
@@ -317,7 +317,7 @@ private final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @
     }
 }
 
-private extension BoundedURLSessionLoader {
+extension BoundedURLSessionLoader {
     func urlSession(
         _ session: URLSession,
         didReceive challenge: URLAuthenticationChallenge,
@@ -364,11 +364,11 @@ private extension BoundedURLSessionLoader {
         task: URLSessionTask,
         needNewBodyStream completionHandler: @escaping @Sendable (InputStream?) -> Void
     ) {
-        guard let delegate = forwardingDelegate as? any URLSessionTaskDelegate else {
-            completionHandler(nil)
-            return
-        }
-        delegate.urlSession(session, task: task, needNewBodyStream: completionHandler)
+        redirectDelegate.urlSession(
+            session,
+            task: task,
+            needNewBodyStream: completionHandler
+        )
     }
 
     func urlSession(

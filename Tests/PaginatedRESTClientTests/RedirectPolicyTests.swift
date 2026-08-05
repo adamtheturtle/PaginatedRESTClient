@@ -83,6 +83,38 @@ struct RedirectPolicyTests {
         #expect(received.withLock { $0 } == expected)
     }
 
+    #if os(Linux)
+    @Test
+    func `the Linux bounded loader replays a file-backed body`() throws {
+        let expected = Data("Linux replay".utf8)
+        let bodyFileURL = FileManager.default.temporaryDirectory
+            .appending(path: "PaginatedRESTClient-\(UUID().uuidString).body")
+        try expected.write(to: bodyFileURL)
+        defer { try? FileManager.default.removeItem(at: bodyFileURL) }
+        let origin = URL(string: "https://api.example.test/upload")!
+        let loader = BoundedURLSessionLoader(
+            successResponseLimit: 1024,
+            errorResponseLimit: 1024,
+            requestURL: origin,
+            bodyFileURL: bodyFileURL,
+            forwardingDelegate: nil
+        )
+        let task = URLSession.shared.dataTask(with: origin)
+        defer { task.cancel() }
+        let received = Mutex<Data?>(nil)
+
+        loader.urlSession(
+            URLSession.shared,
+            task: task,
+            needNewBodyStream: { stream in
+                received.withLock { $0 = readBodyStream(stream) }
+            }
+        )
+
+        #expect(received.withLock { $0 } == expected)
+    }
+    #endif
+
     private func redirectDecision(
         from delegate: SameOriginRedirectDelegate,
         task: URLSessionTask,
