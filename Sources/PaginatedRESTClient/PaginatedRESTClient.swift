@@ -216,14 +216,6 @@ public struct PaginatedRESTClient {
         rateLimitCooldown = RateLimitCooldown()
     }
 
-    public nonisolated func authorizedGET(_ url: URL) -> RESTRequest {
-        RESTRequest(
-            url: url,
-            method: "GET",
-            headers: ["Authorization": "Bearer \(apiKey)", "Accept": "application/json"]
-        )
-    }
-
     public nonisolated func fetch<T: Decodable & Sendable>(_ type: T.Type, path: String) async throws -> T {
         guard !apiKey.isEmpty else { throw errors.missingAPIKey() }
 
@@ -374,21 +366,7 @@ public struct PaginatedRESTClient {
         _ type: T.Type,
         request: RESTRequest
     ) async throws -> T {
-        try await waitForRateLimitCooldown()
-
-        let response: RESTResponse
-        do {
-            response = try await transport.response(for: request)
-        } catch let overflow as RESTResponseTooLargeError {
-            throw errors.decode(
-                "HTTP \(overflow.statusCode) response exceeded the \(overflow.limit)-byte limit"
-            )
-        } catch let urlError as URLError {
-            try Task.checkCancellation()
-            // Surface transport failures (offline, timeout, unreachable) as a typed,
-            // friendly error rather than leaking the raw URLError into the UI.
-            throw errors.network(urlError)
-        }
+        let response = try await transportResponse(for: request)
         guard (200 ..< 300).contains(response.statusCode) else {
             let body = String(data: response.data, encoding: .utf8) ?? ""
             throw HTTPAttemptFailure(
@@ -412,6 +390,23 @@ public struct PaginatedRESTClient {
             )
         } catch let DecodingError.dataCorrupted(ctx) {
             throw errors.decode("corrupted at \(pathString(ctx.codingPath)): \(ctx.debugDescription)")
+        }
+    }
+
+    private nonisolated func transportResponse(for request: RESTRequest) async throws -> RESTResponse {
+        try await waitForRateLimitCooldown()
+
+        do {
+            return try await transport.response(for: request)
+        } catch let overflow as RESTResponseTooLargeError {
+            throw errors.decode(
+                "HTTP \(overflow.statusCode) response exceeded the \(overflow.limit)-byte limit"
+            )
+        } catch let urlError as URLError {
+            try Task.checkCancellation()
+            // Surface transport failures (offline, timeout, unreachable) as a typed,
+            // friendly error rather than leaking the raw URLError into the UI.
+            throw errors.network(urlError)
         }
     }
 
@@ -483,6 +478,33 @@ public struct PaginatedRESTClient {
             try Task.checkCancellation()
             return try make().decode(T.self, from: data)
         }.value
+    }
+}
+
+public extension PaginatedRESTClient {
+    nonisolated func authorizedGET(_ url: URL) -> RESTRequest {
+        RESTRequest(
+            url: url,
+            method: "GET",
+            headers: ["Authorization": "Bearer \(apiKey)", "Accept": "application/json"]
+        )
+    }
+
+    /// Executes a request that has no response model. Any 2xx response succeeds,
+    /// whether its body is empty (including 204) or contains optional server metadata.
+    nonisolated func performNoContent(request: RESTRequest) async throws {
+        do {
+            let response = try await transportResponse(for: request)
+            guard (200 ..< 300).contains(response.statusCode) else {
+                let body = String(data: response.data, encoding: .utf8) ?? ""
+                throw HTTPAttemptFailure(
+                    response: response,
+                    mappedError: errors.http(status: response.statusCode, body: body)
+                )
+            }
+        } catch let failure as HTTPAttemptFailure {
+            throw failure.mappedError
+        }
     }
 }
 
