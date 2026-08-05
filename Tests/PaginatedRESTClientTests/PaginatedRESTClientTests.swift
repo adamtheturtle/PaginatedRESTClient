@@ -204,6 +204,15 @@ private struct StubTransport: RESTTransport {
     }
 }
 
+private nonisolated struct FixedResponseTransport: RESTTransport {
+    let data: Data
+    let status: Int
+
+    func data(for _: RESTRequest) async throws -> (Data, Int) {
+        (data, status)
+    }
+}
+
 /// A wall clock that tests can advance without waiting in real time.
 private nonisolated final class TestClock: @unchecked Sendable {
     private let lock = NSLock()
@@ -410,6 +419,24 @@ struct PaginatedRESTClientTests {
         await #expect(throws: TestErrors.Failure.http(404)) {
             _ = try await makeClient(transport: FailingTransport())
                 .fetch(Thing.self, path: "/things/1")
+        }
+    }
+
+    @Test(arguments: [(204, ""), (200, #"{"status":"ok"}"#)])
+    func `no-content execution accepts empty and JSON success bodies`(status: Int, body: String) async throws {
+        let client = makeClient(transport: FixedResponseTransport(data: Data(body.utf8), status: status))
+        let request = client.authorizedGET(try #require(URL(string: "https://example.test/mutation")))
+
+        try await client.performNoContent(request: request)
+    }
+
+    @Test
+    func `no-content execution retains mapped HTTP failures`() async throws {
+        let client = makeClient(transport: FixedResponseTransport(data: Data("conflict".utf8), status: 409))
+        let request = client.authorizedGET(try #require(URL(string: "https://example.test/mutation")))
+
+        await #expect(throws: TestErrors.Failure.http(409)) {
+            try await client.performNoContent(request: request)
         }
     }
 }
