@@ -686,6 +686,9 @@ struct PaginatedRESTClientTests {
         }
     }
 
+}
+
+extension PaginatedRESTClientTests {
     @Test(arguments: ["   ", "\n\t", "key\nsecond", "key\u{7F}"])
     func `invalid bearer keys cannot build authorized requests`(apiKey: String) async throws {
         let client = PaginatedRESTClient(
@@ -884,7 +887,7 @@ struct RateLimitRetryTests {
     func `nonpositive attempts issue no request`() async throws {
         let transport = CountingStatusTransport(status: 200)
         let client = makeClient(transport: transport)
-        let request = client.authorizedGET(try #require(URL(string: "https://example.test/things/1")))
+        let request = try client.authorizedGET(try #require(URL(string: "https://example.test/things/1")))
 
         await #expect(throws: TestErrors.Failure.decode) {
             _ = try await client.performWithRetry(Thing.self, request: request, maxAttempts: 0)
@@ -1012,7 +1015,7 @@ struct RateLimitRetryTests {
                 jitter: { 0 }
             )
         )
-        let request = client.authorizedGET(try #require(URL(string: "https://example.test/things/1")))
+        let request = try client.authorizedGET(try #require(URL(string: "https://example.test/things/1")))
         let task = Task { try await client.performWithRetry(Thing.self, request: request) }
 
         while sleeper.requestedDelays.isEmpty { await Task.yield() }
@@ -1036,12 +1039,12 @@ struct RateLimitRetryTests {
                 jitter: { 0 }
             )
         )
-        let limited = client.authorizedGET(try #require(URL(string: "https://example.test/limited")))
+        let limited = try client.authorizedGET(try #require(URL(string: "https://example.test/limited")))
         await #expect(throws: TestErrors.Failure.http(429)) {
             _ = try await client.performWithRetry(Thing.self, request: limited, maxAttempts: 1)
         }
 
-        let next = client.authorizedGET(try #require(URL(string: "https://example.test/next")))
+        let next = try client.authorizedGET(try #require(URL(string: "https://example.test/next")))
         let task = Task { try await client.performWithRetry(Thing.self, request: next, maxAttempts: 1) }
         while transport.requestCount(path: "/next") == 0, sleeper.requestedDelays.isEmpty {
             await Task.yield()
