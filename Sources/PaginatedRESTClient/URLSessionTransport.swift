@@ -39,12 +39,13 @@ public struct URLSessionTransport: RESTTransport {
     }
 
     public nonisolated func response(for request: RESTRequest) async throws -> RESTResponse {
-        let urlRequest = Self.urlRequest(from: request)
+        let urlRequest = try Self.urlRequest(from: request)
         #if os(Linux)
         return try await BoundedURLSessionLoader(
             successResponseLimit: successResponseLimit,
             errorResponseLimit: errorResponseLimit,
             requestURL: urlRequest.url,
+            bodyFileURL: request.bodyFileURL,
             forwardingDelegate: session.delegate
         ).load(
             configuration: session.configuration,
@@ -54,6 +55,7 @@ public struct URLSessionTransport: RESTTransport {
         #else
         let redirectDelegate = SameOriginRedirectDelegate(
             requestURL: urlRequest.url,
+            bodyFileURL: request.bodyFileURL,
             forwardingDelegate: session.delegate
         )
         let (bytes, response) = try await session.bytes(for: urlRequest, delegate: redirectDelegate)
@@ -86,13 +88,28 @@ public struct URLSessionTransport: RESTTransport {
     }
 
     /// Translates the backend-neutral `RESTRequest` into a `URLRequest`.
-    private nonisolated static func urlRequest(from request: RESTRequest) -> URLRequest {
+    private nonisolated static func urlRequest(from request: RESTRequest) throws -> URLRequest {
+        guard request.body == nil || request.bodyFileURL == nil else {
+            throw RESTRequestBodyError.multipleSources
+        }
         var urlRequest = URLRequest(url: request.url)
         urlRequest.httpMethod = request.method
         for (field, value) in request.headers {
             urlRequest.setValue(value, forHTTPHeaderField: field)
         }
-        urlRequest.httpBody = request.body
+        if let bodyFileURL = request.bodyFileURL {
+            guard bodyFileURL.isFileURL else {
+                throw RESTRequestBodyError.bodyFileMustBeFileURL(bodyFileURL)
+            }
+            guard FileManager.default.isReadableFile(atPath: bodyFileURL.path),
+                  let stream = InputStream(url: bodyFileURL)
+            else {
+                throw RESTRequestBodyError.unreadableBodyFile(bodyFileURL)
+            }
+            urlRequest.httpBodyStream = stream
+        } else {
+            urlRequest.httpBody = request.body
+        }
         return urlRequest
     }
 }
@@ -149,12 +166,14 @@ private final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @
         successResponseLimit: Int,
         errorResponseLimit: Int,
         requestURL: URL?,
+        bodyFileURL: URL?,
         forwardingDelegate: (any URLSessionDelegate)?
     ) {
         self.successResponseLimit = successResponseLimit
         self.errorResponseLimit = errorResponseLimit
         redirectDelegate = SameOriginRedirectDelegate(
             requestURL: requestURL,
+            bodyFileURL: bodyFileURL,
             forwardingDelegate: forwardingDelegate
         )
         self.forwardingDelegate = forwardingDelegate
