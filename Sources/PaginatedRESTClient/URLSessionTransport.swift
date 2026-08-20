@@ -170,7 +170,8 @@ public struct URLSessionTransport: RESTTransport {
 
     /// Uses HTTPURLResponse's string accessor instead of debug descriptions of bridged
     /// values (such as NSArray), which can add quotes and brackets not present on the wire.
-    private nonisolated static func responseHeaders(from response: HTTPURLResponse) -> [String: String] {
+    /// Package-visible so the Linux bounded loader can reuse the same header projection.
+    nonisolated static func responseHeaders(from response: HTTPURLResponse) -> [String: String] {
         response.allHeaderFields.reduce(into: [String: String]()) { result, field in
             guard let name = field.key as? String,
                   let value = response.value(forHTTPHeaderField: name)
