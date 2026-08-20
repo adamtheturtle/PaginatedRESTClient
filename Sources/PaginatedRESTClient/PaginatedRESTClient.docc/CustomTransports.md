@@ -136,9 +136,19 @@ struct AlamofireTransport: RESTTransport {
         for (field, value) in request.headers {
             urlRequest.setValue(value, forHTTPHeaderField: field)
         }
-        urlRequest.httpBody = request.body
 
-        let response = await session.request(urlRequest)
+        let dataRequest: DataRequest
+        if let bodyFileURL = request.bodyFileURL {
+            guard request.body == nil else {
+                throw RESTRequestBodyError.multipleSources
+            }
+            dataRequest = session.upload(bodyFileURL, with: urlRequest)
+        } else {
+            urlRequest.httpBody = request.body
+            dataRequest = session.request(urlRequest)
+        }
+
+        let response = await dataRequest
             .serializingData(emptyResponseCodes: [200, 204, 205])
             .response
 

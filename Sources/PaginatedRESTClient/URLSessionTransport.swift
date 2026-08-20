@@ -123,7 +123,7 @@ public struct URLSessionTransport: RESTTransport {
         try request.validate()
         var urlRequest = URLRequest(url: request.url)
         urlRequest.httpMethod = request.method
-        for (field, value) in request.headers {
+        for (field, value) in request.headers.sorted(by: { $0.key.lowercased() < $1.key.lowercased() }) {
             urlRequest.setValue(value, forHTTPHeaderField: field)
         }
         if let bodyFileURL = request.bodyFileURL {

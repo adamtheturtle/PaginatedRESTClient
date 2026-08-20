@@ -1507,6 +1507,14 @@ private nonisolated struct FirstThenNumberedTransport: LegacyRESTTransport {
 @Suite("Pagination open-issue regressions")
 struct PaginationIssueRegressionTests {
     @Test
+    func `reordered query forms share a canonical page identity`() throws {
+        let client = makeClient()
+        let first = try #require(URL(string: "https://example.test/things?a=1&page=2"))
+        let reordered = try #require(URL(string: "https://example.test/things?page=%32&a=1"))
+        #expect(client.canonicalPageURL(first) == client.canonicalPageURL(reordered))
+    }
+
+    @Test
     func `configured base URL fragments do not appear on request URLs`() async throws {
         let captured = CapturedRequests()
         let base = try #require(URL(string: "https://example.test/api/#section"))
@@ -1763,6 +1771,31 @@ private nonisolated struct CancellationProbeTransport: LegacyRESTTransport {
     }
 }
 
+private nonisolated final class CancellationRaceTransport: LegacyRESTTransport, @unchecked Sendable {
+    enum Failure: Error { case terminal }
+
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func data(for _: RESTRequest) async throws -> (Data, Int) {
+        await withCheckedContinuation { continuation in
+            lock.withLock { self.continuation = continuation }
+        }
+        throw Failure.terminal
+    }
+
+    func release() {
+        lock.withLock {
+            continuation?.resume()
+            continuation = nil
+        }
+    }
+
+    var started: Bool {
+        lock.withLock { continuation != nil }
+    }
+}
+
 private struct BroadlyTransientErrors: RESTTransportErrorMapping {
     enum Failure: Error { case other }
     nonisolated func missingAPIKey() -> any Error { Failure.other }
@@ -1938,6 +1971,22 @@ struct ClientIssueRegressionTests {
         await #expect(throws: CancellationError.self) {
             _ = try await client.performWithRetry(Thing.self, request: request, maxAttempts: 3)
         }
+    }
+
+    @Test
+    func `cancellation racing a custom terminal failure surfaces cancellation`() async throws {
+        let transport = CancellationRaceTransport()
+        let client = makeClient(transport: transport)
+        let request = try client.authorizedGET(#require(URL(string: "https://example.test/things/1")))
+        let task = Task {
+            try await client.performWithRetry(Thing.self, request: request, maxAttempts: 1)
+        }
+        #expect(await waitUntil { transport.started })
+
+        task.cancel()
+        transport.release()
+
+        await #expect(throws: CancellationError.self) { try await task.value }
     }
 
     @Test

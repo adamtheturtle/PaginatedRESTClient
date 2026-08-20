@@ -61,6 +61,13 @@ public nonisolated struct RESTRequest: Sendable {
         guard headers.allSatisfy({ Self.isValidHeaderName($0.key) && Self.isValidHeaderValue($0.value) }) else {
             throw RESTRequestError.invalidHeaderField
         }
+        var seenNames = Set<String>()
+        for name in headers.keys {
+            let canonical = name.lowercased()
+            guard seenNames.insert(canonical).inserted else {
+                throw RESTRequestError.duplicateHeaderField(name)
+            }
+        }
     }
 
     /// RFC 9110 method tokens: nonempty ASCII `tchar` sequences.
@@ -131,6 +138,8 @@ public nonisolated enum RESTRequestError: Error, Equatable, Sendable {
     case unsupportedURL(URL)
     /// A header name or value cannot be represented safely as an HTTP field.
     case invalidHeaderField
+    /// Two header names differ only by case; HTTP field names are case-insensitive.
+    case duplicateHeaderField(String)
     /// The session configuration cannot run the package's data-task transfer path.
     case unsupportedBackgroundSession
 }

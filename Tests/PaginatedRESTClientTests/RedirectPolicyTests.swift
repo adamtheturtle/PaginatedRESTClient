@@ -43,6 +43,30 @@ struct RedirectPolicyTests {
     }
 
     @Test
+    func `cross-origin delayed request substitutions are cancelled`() async {
+        let origin = URL(string: "https://api.example.test/v1/resources")!
+        let replacement = URLRequest(url: URL(string: "https://attacker.example/resources")!)
+        let delegate = SameOriginRedirectDelegate(
+            requestURL: origin,
+            forwardingDelegate: DelayedRequestSubstitutionDelegate(replacement: replacement)
+        )
+        let task = URLSession.shared.dataTask(with: origin)
+        defer { task.cancel() }
+
+        let decision = await withCheckedContinuation { continuation in
+            delegate.urlSession(
+                URLSession.shared,
+                task: task,
+                willBeginDelayedRequest: URLRequest(url: origin),
+                completionHandler: { continuation.resume(returning: ($0, $1)) }
+            )
+        }
+
+        #expect(decision.0 == .cancel)
+        #expect(decision.1 == nil)
+    }
+
+    @Test
     func `only scheme host and effective port define the authenticated origin`() {
         let origin = URL(string: "https://api.example.test/v1/resources")!
 
@@ -168,6 +192,24 @@ struct RedirectPolicyTests {
         }
     }
 
+}
+
+private nonisolated final class DelayedRequestSubstitutionDelegate: NSObject, URLSessionTaskDelegate,
+    @unchecked Sendable {
+    let replacement: URLRequest
+
+    init(replacement: URLRequest) {
+        self.replacement = replacement
+    }
+
+    func urlSession(
+        _: URLSession,
+        task _: URLSessionTask,
+        willBeginDelayedRequest _: URLRequest,
+        completionHandler: @escaping @Sendable (URLSession.DelayedRequestDisposition, URLRequest?) -> Void
+    ) {
+        completionHandler(.useNewRequest, replacement)
+    }
 }
 
 private nonisolated func readBodyStream(_ stream: InputStream?) -> Data {
