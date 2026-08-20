@@ -811,15 +811,13 @@ public struct PaginatedRESTClient {
         }
         let encoded: Data
         do {
+            // Detach from the caller executor so large JSON bodies do not encode on
+            // MainActor (or any other caller actor) under NonisolatedNonsendingByDefault.
             let makeEncoder = encoderFactory
-            encoded = try await withThrowingTaskGroup(of: Data.self) { group in
-                group.addTask {
-                    try Task.checkCancellation()
-                    return try makeEncoder().encode(body)
-                }
-                guard let data = try await group.next() else { throw CancellationError() }
-                return data
-            }
+            encoded = try await Task.detached {
+                try Task.checkCancellation()
+                return try makeEncoder().encode(body)
+            }.value
         } catch is CancellationError {
             throw CancellationError()
         } catch {
@@ -1752,19 +1750,36 @@ nonisolated func fetchKnownPages<W: PagedResponse>(
     // a legitimate duplicate-only page caused by concurrent list drift.
     var tailNextPage: String?
     var tailResponseURL = pageURL(pageCount) ?? baseURL
-    var pending: [Int: (page: W, responseURL: URL)] = [:]
+    enum PendingPage {
+        case loaded(page: W, responseURL: URL)
+        /// Speculative page past the live list (stale `total`); keep prior records.
+        case missing
+    }
+    var pending: [Int: PendingPage] = [:]
     var nextToEmit = 2
     var collected = items
-    try await withThrowingTaskGroup(of: (Int, W, URL).self) { group in
+    enum PageFetchOutcome: Sendable {
+        case success(Int, W, URL)
+        case notFound(Int)
+    }
+    try await withThrowingTaskGroup(of: PageFetchOutcome.self) { group in
         func enqueue(_ page: Int) throws {
             guard let url = pageURL(page) else { throw errors.invalidRequest("Invalid URL") }
 
             group.addTask {
-                let attempt = try await performWithRetryAttempt(
-                    W.self,
-                    request: try authorizedGET(url)
-                )
-                return (page, attempt.value, attempt.responseURL)
+                do {
+                    let attempt = try await performWithRetryAttempt(
+                        W.self,
+                        request: try authorizedGET(url)
+                    )
+                    return .success(page, attempt.value, attempt.responseURL)
+                } catch {
+                    // Stale high `total` requests pages that no longer exist (#171).
+                    if Self.isNotFoundHTTPError(error) {
+                        return .notFound(page)
+                    }
+                    throw error
+                }
             }
         }
         // Keep a bounded window in flight - enough to saturate the network without
@@ -1774,62 +1789,88 @@ nonisolated func fetchKnownPages<W: PagedResponse>(
         while nextToFetch <= pageCount, nextToFetch - 2 < maxConcurrent {
             try enqueue(nextToFetch); nextToFetch += 1
         }
-        while let (page, response, responseURL) = try await group.next() {
-            // Reject malformed speculative pages as soon as they finish. Waiting for a
-            // missing earlier page used to retain invalid responses in `pending` and delay
-            // the failure unnecessarily.
-            try validateParallelIdentities(response)
-            pending[page] = (response, responseURL)
-            // Emit a new snapshot whenever the contiguous prefix grows.
-            var grew = false
-            var reachedDeclaredEnd = false
-            while let ready = pending.removeValue(forKey: nextToEmit) {
-                let added = Self.appendNew(
-                    ready.page.pageItems,
-                    to: &collected,
-                    seen: &seen,
-                    identity: W.identity(of:),
-                    deduplicate: true
-                )
-                // The final page's `next_page` tells us whether the estimate fell
-                // short. A duplicate-only page can still be genuinely in range after
-                // concurrent insert/delete drift, so do not require it to add rows.
-                // Reject only links that point back into the already fetched numbered
-                // range, which is how an out-of-range request clamped to page one shows
-                // up here.
-                if nextToEmit == pageCount {
-                    tailResponseURL = ready.responseURL
-                    tailNextPage = try advancingTailNextPage(
-                        ready.page.nextPage,
-                        afterEstimatedPage: pageCount,
-                        pageAddedItems: added,
-                        relativeTo: ready.responseURL
-                    )
-                } else if ready.page.nextPage == nil {
-                    // An ordered intermediate page is authoritative. Requests beyond it
-                    // were speculative and their rows must not enter the result.
-                    reachedDeclaredEnd = true
-                    pending.removeAll()
+        do {
+            while let fetch = try await group.next() {
+                switch fetch {
+                case let .success(page, response, responseURL):
+                    // Reject malformed speculative pages as soon as they finish. Waiting for a
+                    // missing earlier page used to retain invalid responses in `pending` and delay
+                    // the failure unnecessarily.
+                    try validateParallelIdentities(response)
+                    pending[page] = .loaded(page: response, responseURL: responseURL)
+                case let .notFound(page):
+                    pending[page] = .missing
                 }
-                nextToEmit += 1
-                grew = grew || added > 0
-                if reachedDeclaredEnd { break }
+                // Emit a new snapshot whenever the contiguous prefix grows.
+                var grew = false
+                var reachedDeclaredEnd = false
+                while let ready = pending.removeValue(forKey: nextToEmit) {
+                    switch ready {
+                    case .missing:
+                        // Preceding contiguous pages are authoritative; drop speculative 404s.
+                        reachedDeclaredEnd = true
+                        pending.removeAll()
+                    case let .loaded(response, responseURL):
+                        let added = Self.appendNew(
+                            response.pageItems,
+                            to: &collected,
+                            seen: &seen,
+                            identity: W.identity(of:),
+                            deduplicate: true
+                        )
+                        // The final page's `next_page` tells us whether the estimate fell
+                        // short. A duplicate-only page can still be genuinely in range after
+                        // concurrent insert/delete drift, so do not require it to add rows.
+                        // Reject only links that point back into the already fetched numbered
+                        // range, which is how an out-of-range request clamped to page one shows
+                        // up here.
+                        if nextToEmit == pageCount {
+                            tailResponseURL = responseURL
+                            tailNextPage = try advancingTailNextPage(
+                                response.nextPage,
+                                afterEstimatedPage: pageCount,
+                                pageAddedItems: added,
+                                relativeTo: responseURL
+                            )
+                        } else if response.nextPage == nil {
+                            // An ordered intermediate page is authoritative. Requests beyond it
+                            // were speculative and their rows must not enter the result.
+                            reachedDeclaredEnd = true
+                            pending.removeAll()
+                        }
+                        nextToEmit += 1
+                        grew = grew || added > 0
+                    }
+                    if reachedDeclaredEnd { break }
+                }
+                if grew { emit(collected) }
+                if reachedDeclaredEnd {
+                    group.cancelAll()
+                    break
+                }
+                // Bound how far completed pages can get ahead of the next ordered page.
+                // A slow early page therefore cannot allow the whole list to accumulate.
+                while nextToFetch <= pageCount, nextToFetch < nextToEmit + maxConcurrent {
+                    try enqueue(nextToFetch)
+                    nextToFetch += 1
+                }
             }
-            if grew { emit(collected) }
-            if reachedDeclaredEnd {
-                group.cancelAll()
-                break
-            }
-            // Bound how far completed pages can get ahead of the next ordered page.
-            // A slow early page therefore cannot allow the whole list to accumulate.
-            while nextToFetch <= pageCount, nextToFetch < nextToEmit + maxConcurrent {
-                try enqueue(nextToFetch)
-                nextToFetch += 1
-            }
+        } catch {
+            group.cancelAll()
+            throw error
         }
     }
     items = collected
     return (tailNextPage, tailResponseURL)
+}
+
+nonisolated static func isNotFoundHTTPError(_ error: any Error) -> Bool {
+    let detail = String(describing: error)
+    if detail.contains("404") && detail.lowercased().contains("http") {
+        return true
+    }
+    // Mirror common client mappings such as `.http(404)` / `http status 404`.
+    return detail.contains("(404)") || detail.hasSuffix("404")
 }
 
 nonisolated func advancingTailNextPage(

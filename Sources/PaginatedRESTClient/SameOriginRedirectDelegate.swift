@@ -248,6 +248,21 @@ final nonisolated class SameOriginRedirectDelegate: NSObject, URLSessionTaskDele
         #endif
     }
 
+    #if !canImport(FoundationNetworking)
+    func urlSession(_ session: URLSession, taskIsWaitingForConnectivity task: URLSessionTask) {
+        forwardingDelegate?.urlSession?(session, taskIsWaitingForConnectivity: task)
+    }
+
+    @available(macOS 14.0, iOS 17.0, tvOS 17.0, watchOS 10.0, *)
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didReceiveInformationalResponse response: HTTPURLResponse
+    ) {
+        forwardingDelegate?.urlSession?(session, task: task, didReceiveInformationalResponse: response)
+    }
+    #endif
+
     static func hasSameOrigin(_ first: URL?, _ second: URL?) -> Bool {
         guard let first = origin(from: first), let second = origin(from: second) else { return false }
         return first == second

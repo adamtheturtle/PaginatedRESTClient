@@ -233,6 +233,11 @@ public nonisolated struct RESTResponse: Sendable {
 
 /// Executes a `RESTRequest` and returns its raw response body, HTTP status, and headers.
 ///
+/// Cancellation: implementations must observe `Task.isCancelled` (and cancel underlying
+/// HTTP work) promptly. Parallel pagination cancels in-flight sibling pages when one
+/// page fails; a transport that ignores cancellation can delay that failure indefinitely
+/// until its non-cooperative work finishes (see issue #169).
+///
 /// A transport does exactly that and nothing more: no decoding, no retry, no backoff, no
 /// auth - all of which the paginator owns. Conformers translate `RESTRequest` into their
 /// HTTP client's request type, perform it, and report the resulting ``RESTResponse``. Throwing a
