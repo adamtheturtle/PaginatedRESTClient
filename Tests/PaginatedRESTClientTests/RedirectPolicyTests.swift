@@ -156,10 +156,9 @@ struct RedirectPolicyTests {
         #expect(received.withLock { $0 } == expected)
     }
 
-    #if os(Linux)
     @Test
-    func `the Linux bounded loader replays a file-backed body`() throws {
-        let expected = Data("Linux replay".utf8)
+    func `the bounded loader replays a file-backed body`() throws {
+        let expected = Data("body replay".utf8)
         let bodyFileURL = FileManager.default.temporaryDirectory
             .appending(path: "PaginatedRESTClient-\(UUID().uuidString).body")
         try expected.write(to: bodyFileURL)
@@ -186,7 +185,6 @@ struct RedirectPolicyTests {
 
         #expect(received.withLock { $0 } == expected)
     }
-    #endif
 
     @Test(arguments: [
         "https://user@api.example.test/v2/resources",

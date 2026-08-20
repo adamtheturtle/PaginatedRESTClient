@@ -53,6 +53,27 @@ that blindly replays the original ``RESTRequest/headers`` on every hop can reint
 credential leak. Treat same-origin redirect policy as part of the ``RESTTransport`` contract,
 not an optional URLSession detail.
 
+## `URLSessionTransport` session and delegate contract
+
+``URLSessionTransport`` always runs requests on the **supplied** `URLSession`. It installs a
+task-specific bounded data delegate so response bodies are collected in chunks with the
+configured byte ceilings. That means:
+
+- **Session lifecycle.** Invalidating or cancelling the session you pass in stops further
+  transport work on every platform. The transport does not create a replacement session.
+- **Connection pooling.** Sequential and concurrent page fetches reuse the supplied session's
+  connections (including on Linux).
+- **Delegate identity.** Forwarded `URLSessionDelegate` callbacks receive the supplied session
+  instance, so policy keyed on session identity keeps working.
+- **Response disposition.** Only `.allow` and `.cancel` are honored. If a data delegate returns
+  `.becomeDownload` or `.becomeStream`, the transport coerces the disposition to `.allow` and
+  continues as a bounded data task so a ``RESTResponse`` can still be produced.
+- **Cancellation.** Cancelling the Swift task cancels the underlying `URLSessionDataTask` without
+  invalidating the shared session.
+
+Task-level callbacks that exist on the current SDK (including waiting-for-connectivity and
+informational HTTP responses) are forwarded to the supplied session delegate when present.
+
 ## Get (kean/Get)
 
 [Get](https://github.com/kean/Get) is a thin async wrapper over `URLSession`. Its

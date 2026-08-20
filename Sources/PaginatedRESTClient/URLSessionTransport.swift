@@ -70,7 +70,10 @@ public struct URLSessionTransport: RESTTransport {
             throw RESTRequestError.unsupportedBackgroundSession
         }
         let urlRequest = try Self.urlRequest(from: request)
-        #if os(Linux)
+        // Both Apple and Linux use a bounded data-task loader on the *supplied* session so
+        // connection pooling, session identity in delegate callbacks, and invalidation all
+        // match direct URLSession use. Body bytes arrive in `didReceive data` chunks rather
+        // than one AsyncBytes element at a time.
         return try await BoundedURLSessionLoader(
             successResponseLimit: successResponseLimit,
             errorResponseLimit: errorResponseLimit,
@@ -79,61 +82,7 @@ public struct URLSessionTransport: RESTTransport {
             requiresSameOrigin: Self.requiresSameOrigin(urlRequest, bodyFileURL: request.bodyFileURL),
             retainingSuccessBody: retainingSuccessBody,
             forwardingDelegate: session.delegate
-        ).load(
-            configuration: session.configuration,
-            delegateQueue: session.delegateQueue,
-            request: urlRequest
-        )
-        #else
-        let redirectDelegate = SameOriginRedirectDelegate(
-            requestURL: urlRequest.url,
-            bodyFileURL: request.bodyFileURL,
-            requiresSameOrigin: Self.requiresSameOrigin(urlRequest, bodyFileURL: request.bodyFileURL),
-            forwardingDelegate: session.delegate
-        )
-        let (bytes, response) = try await session.bytes(for: urlRequest, delegate: redirectDelegate)
-        guard let http = response as? HTTPURLResponse else {
-            // A non-HTTP response is a transport-level anomaly; surface it as a URLError
-            // so the paginator routes it through the error mapping's `network(_:)` case.
-            throw URLError(.badServerResponse)
-        }
-        let limit = (200 ..< 300).contains(http.statusCode) ? successResponseLimit : errorResponseLimit
-        let retainBody = retainingSuccessBody || !(200 ..< 300).contains(http.statusCode)
-        // HEAD is explicitly bodyless. Its Content-Length describes the corresponding GET
-        // representation, rather than bytes transferred by this response.
-        let declared = request.method == "HEAD" || !retainBody ? nil : (
-            http.expectedContentLength >= 0 ? http.expectedContentLength : nil
-        )
-        guard declared.map({ $0 <= Int64(limit) }) ?? true else {
-            throw RESTResponseTooLargeError(
-                statusCode: http.statusCode,
-                limit: limit,
-                phase: .headers,
-                declaredContentLength: declared,
-                observedByteCount: 0
-            )
-        }
-
-        var data = Data()
-        if retainBody, http.expectedContentLength > 0 {
-            data.reserveCapacity(Int(http.expectedContentLength))
-        }
-        for try await byte in bytes {
-            guard retainBody else { continue }
-            guard data.count < limit else {
-                throw RESTResponseTooLargeError(
-                    statusCode: http.statusCode,
-                    limit: limit,
-                    phase: .body,
-                    declaredContentLength: declared,
-                    observedByteCount: data.count
-                )
-            }
-            data.append(byte)
-        }
-        let headers = Self.responseHeaders(from: http)
-        return RESTResponse(data: data, statusCode: http.statusCode, headers: headers, url: http.url)
-        #endif
+        ).load(on: session, request: urlRequest)
     }
 
     /// Translates the backend-neutral `RESTRequest` into a `URLRequest`.
@@ -264,23 +213,24 @@ public nonisolated struct RESTResponseTooLargeError: Error, Equatable, Sendable 
     }
 }
 
-#if os(Linux)
+/// Collects a bounded response body through `URLSessionDataDelegate` chunk callbacks on the
+/// caller's session. Used on every platform so Apple avoids byte-at-a-time `AsyncBytes`
+/// appends and Linux preserves connection pooling / session identity.
 final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private struct State {
         var continuation: CheckedContinuation<RESTResponse, any Error>?
-        var session: URLSession?
         var task: URLSessionDataTask?
         var response: HTTPURLResponse?
         var data = Data()
         var limit = 0
         var completed = false
         var cancelled = false
+        var retainBody = true
     }
 
     private struct CancellationResources {
         let continuation: CheckedContinuation<RESTResponse, any Error>?
         let task: URLSessionDataTask?
-        let session: URLSession?
     }
 
     private enum DataReceipt {
@@ -318,19 +268,15 @@ final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecke
         self.forwardingDelegate = forwardingDelegate
     }
 
-    func load(
-        configuration: URLSessionConfiguration,
-        delegateQueue: OperationQueue,
-        request: URLRequest
-    ) async throws -> RESTResponse {
+    /// Runs `request` on the supplied `session` with this loader as the task delegate.
+    /// The session is never invalidated by the loader; callers own its lifecycle.
+    func load(on session: URLSession, request: URLRequest) async throws -> RESTResponse {
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 let task = lock.withLock { () -> URLSessionDataTask? in
                     guard !state.cancelled else { return nil }
-                    let session = URLSession(configuration: configuration, delegate: self, delegateQueue: delegateQueue)
                     let task = session.dataTask(with: request)
                     state.continuation = continuation
-                    state.session = session
                     state.task = task
                     return task
                 }
@@ -338,11 +284,23 @@ final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecke
                     continuation.resume(throwing: CancellationError())
                     return
                 }
+                // Task-specific delegate receives data/redirect callbacks while still using
+                // the caller's session (pooling, identity, and invalidation).
+                task.delegate = self
                 task.resume()
             }
         } onCancel: {
             cancel()
         }
+    }
+
+    /// The bounded loader only completes data-task transfers. Caller dispositions other than
+    /// `.allow` / `.cancel` (for example `.becomeDownload` / `.becomeStream`) are coerced to
+    /// `.allow` so a `RESTResponse` can still be produced.
+    nonisolated static func constrainedResponseDisposition(
+        _ disposition: URLSession.ResponseDisposition
+    ) -> URLSession.ResponseDisposition {
+        disposition == .cancel ? .cancel : .allow
     }
 
     func urlSession(
@@ -358,6 +316,8 @@ final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecke
         }
         let limit = (200 ..< 300).contains(http.statusCode) ? successResponseLimit : errorResponseLimit
         let retainBody = retainingSuccessBody || !(200 ..< 300).contains(http.statusCode)
+        // HEAD is explicitly bodyless. Its Content-Length describes the corresponding GET
+        // representation, rather than bytes transferred by this response.
         let declared = dataTask.originalRequest?.httpMethod == "HEAD" || !retainBody ? nil : (
             http.expectedContentLength >= 0 ? http.expectedContentLength : nil
         )
@@ -377,27 +337,38 @@ final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecke
             guard !state.completed else { return }
             state.response = http
             state.limit = limit
+            state.retainBody = retainBody
             if retainBody, http.expectedContentLength > 0 {
                 state.data.reserveCapacity(Int(http.expectedContentLength))
             }
         }
+
+        let finish: @Sendable (URLSession.ResponseDisposition) -> Void = { disposition in
+            completionHandler(Self.constrainedResponseDisposition(disposition))
+        }
         guard let delegate = forwardingDelegate as? any URLSessionDataDelegate else {
-            completionHandler(.allow)
+            finish(.allow)
             return
         }
-        delegate.urlSession(session, dataTask: dataTask, didReceive: response) { disposition in
-            completionHandler(disposition)
+        #if canImport(FoundationNetworking)
+        delegate.urlSession(session, dataTask: dataTask, didReceive: response, completionHandler: finish)
+        #else
+        let forwarded: Void? = delegate.urlSession?(
+            session,
+            dataTask: dataTask,
+            didReceive: response,
+            completionHandler: finish
+        )
+        if forwarded == nil {
+            finish(.allow)
         }
+        #endif
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        let shouldRetain = retainingSuccessBody || lock.withLock {
-            guard let response = state.response else { return true }
-            return !(200 ..< 300).contains(response.statusCode)
-        }
+        let shouldRetain = lock.withLock { state.retainBody }
         guard shouldRetain else {
-            (forwardingDelegate as? any URLSessionDataDelegate)?
-                .urlSession(session, dataTask: dataTask, didReceive: data)
+            forwardDidReceiveData(session, dataTask: dataTask, data: data)
             return
         }
         let receipt = lock.withLock { () -> DataReceipt in
@@ -419,8 +390,7 @@ final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecke
         case .ignored:
             break
         case .accepted:
-            (forwardingDelegate as? any URLSessionDataDelegate)?
-                .urlSession(session, dataTask: dataTask, didReceive: data)
+            forwardDidReceiveData(session, dataTask: dataTask, data: data)
         case let .overflow(error):
             dataTask.cancel()
             complete(.failure(error))
@@ -428,8 +398,13 @@ final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecke
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: (any Error)?) {
+        #if canImport(FoundationNetworking)
         (forwardingDelegate as? any URLSessionTaskDelegate)?
             .urlSession(session, task: task, didCompleteWithError: error)
+        #else
+        (forwardingDelegate as? any URLSessionTaskDelegate)?
+            .urlSession?(session, task: task, didCompleteWithError: error)
+        #endif
         if let error {
             complete(.failure(error))
             return
@@ -447,58 +422,62 @@ final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecke
         complete(result.map(Result.success) ?? .failure(URLError(.badServerResponse)))
     }
 
+    private func forwardDidReceiveData(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        data: Data
+    ) {
+        #if canImport(FoundationNetworking)
+        (forwardingDelegate as? any URLSessionDataDelegate)?
+            .urlSession(session, dataTask: dataTask, didReceive: data)
+        #else
+        (forwardingDelegate as? any URLSessionDataDelegate)?
+            .urlSession?(session, dataTask: dataTask, didReceive: data)
+        #endif
+    }
+
     private func cancel() {
         let resources = lock.withLock { () -> CancellationResources in
             state.cancelled = true
             guard !state.completed else {
-                return CancellationResources(continuation: nil, task: nil, session: nil)
+                return CancellationResources(continuation: nil, task: nil)
             }
             state.completed = true
             let result = CancellationResources(
                 continuation: state.continuation,
-                task: state.task,
-                session: state.session
+                task: state.task
             )
             state.continuation = nil
             state.task = nil
-            state.session = nil
             return result
         }
         resources.task?.cancel()
-        resources.session?.invalidateAndCancel()
         resources.continuation?.resume(throwing: CancellationError())
     }
 
     private func complete(_ result: Result<RESTResponse, any Error>) {
-        let resources = lock.withLock { () -> (CheckedContinuation<RESTResponse, any Error>?, URLSession?) in
-            guard !state.completed else { return (nil, nil) }
+        let continuation = lock.withLock { () -> CheckedContinuation<RESTResponse, any Error>? in
+            guard !state.completed else { return nil }
             state.completed = true
-            let result = (state.continuation, state.session)
+            let continuation = state.continuation
             state.continuation = nil
             state.task = nil
-            state.session = nil
-            return result
+            return continuation
         }
-        resources.1?.finishTasksAndInvalidate()
-        resources.0?.resume(with: result)
+        continuation?.resume(with: result)
     }
 }
 
 extension BoundedURLSessionLoader {
     // Intentionally do not forward `urlSession(_:didBecomeInvalidWithError:)`.
-    // This loader owns a per-request session; telling the caller's delegate that *their*
-    // session was invalidated would tear down shared networking after one request.
+    // The loader never owns the caller's session; invalidation belongs to the session owner.
 
     func urlSession(
         _ session: URLSession,
         didReceive challenge: URLAuthenticationChallenge,
         completionHandler: @escaping @Sendable (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
-        guard let forwardingDelegate else {
-            completionHandler(.performDefaultHandling, nil)
-            return
-        }
-        forwardingDelegate.urlSession(session, didReceive: challenge, completionHandler: completionHandler)
+        redirectDelegate.urlSession(session, didReceive: challenge, completionHandler: completionHandler)
     }
 
     func urlSession(
@@ -523,11 +502,12 @@ extension BoundedURLSessionLoader {
         didReceive challenge: URLAuthenticationChallenge,
         completionHandler: @escaping @Sendable (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
-        guard let delegate = forwardingDelegate as? any URLSessionTaskDelegate else {
-            completionHandler(.performDefaultHandling, nil)
-            return
-        }
-        delegate.urlSession(session, task: task, didReceive: challenge, completionHandler: completionHandler)
+        redirectDelegate.urlSession(
+            session,
+            task: task,
+            didReceive: challenge,
+            completionHandler: completionHandler
+        )
     }
 
     func urlSession(
@@ -549,7 +529,7 @@ extension BoundedURLSessionLoader {
         totalBytesSent: Int64,
         totalBytesExpectedToSend: Int64
     ) {
-        (forwardingDelegate as? any URLSessionTaskDelegate)?.urlSession(
+        redirectDelegate.urlSession(
             session,
             task: task,
             didSendBodyData: bytesSent,
@@ -564,11 +544,7 @@ extension BoundedURLSessionLoader {
         willBeginDelayedRequest request: URLRequest,
         completionHandler: @escaping @Sendable (URLSession.DelayedRequestDisposition, URLRequest?) -> Void
     ) {
-        guard let delegate = forwardingDelegate as? any URLSessionTaskDelegate else {
-            completionHandler(.continueLoading, nil)
-            return
-        }
-        delegate.urlSession(
+        redirectDelegate.urlSession(
             session,
             task: task,
             willBeginDelayedRequest: request,
@@ -577,9 +553,23 @@ extension BoundedURLSessionLoader {
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics) {
-        (forwardingDelegate as? any URLSessionTaskDelegate)?
-            .urlSession(session, task: task, didFinishCollecting: metrics)
+        redirectDelegate.urlSession(session, task: task, didFinishCollecting: metrics)
     }
+
+    #if !canImport(FoundationNetworking)
+    func urlSession(_ session: URLSession, taskIsWaitingForConnectivity task: URLSessionTask) {
+        redirectDelegate.urlSession(session, taskIsWaitingForConnectivity: task)
+    }
+
+    @available(macOS 14.0, iOS 17.0, tvOS 17.0, watchOS 10.0, *)
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didReceiveInformationalResponse response: HTTPURLResponse
+    ) {
+        redirectDelegate.urlSession(session, task: task, didReceiveInformationalResponse: response)
+    }
+    #endif
 
     func urlSession(
         _ session: URLSession,
@@ -591,12 +581,23 @@ extension BoundedURLSessionLoader {
             completionHandler(proposedResponse)
             return
         }
+        #if canImport(FoundationNetworking)
         delegate.urlSession(
             session,
             dataTask: dataTask,
             willCacheResponse: proposedResponse,
             completionHandler: completionHandler
         )
+        #else
+        let forwarded: Void? = delegate.urlSession?(
+            session,
+            dataTask: dataTask,
+            willCacheResponse: proposedResponse,
+            completionHandler: completionHandler
+        )
+        if forwarded == nil {
+            completionHandler(proposedResponse)
+        }
+        #endif
     }
 }
-#endif

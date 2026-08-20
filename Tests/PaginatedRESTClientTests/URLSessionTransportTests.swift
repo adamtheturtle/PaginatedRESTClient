@@ -160,8 +160,8 @@ struct URLSessionTransportTests {
         #expect(error?.statusCode == status)
         #expect(error?.limit == 8)
         #expect(error?.phase == .body)
-        // Apple streams byte-by-byte so rejection lands at exactly `limit`; Linux may
-        // receive a larger first chunk and reject with zero accepted bytes.
+        // Both platforms collect body chunks via the data delegate; rejection may land at
+        // exactly `limit` or earlier when a single chunk would cross the ceiling.
         #expect((error?.observedByteCount ?? -1) <= 8)
     }
 
@@ -268,21 +268,125 @@ struct URLSessionTransportTests {
         #expect(body.contains("exceeded the 8-byte limit"))
     }
 
-    #if os(Linux)
     @Test
-    func `the Linux bounded loader preserves the supplied session delegate`() async throws {
+    func `the bounded loader preserves the supplied session delegate and identity`() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [ResponseLimitURLProtocol.self]
-        let delegate = CompletionRecordingDelegate()
+        let delegate = TransportDelegateSpy()
         let queue = OperationQueue()
         queue.maxConcurrentOperationCount = 1
         let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: queue)
         let transport = URLSessionTransport(session: session)
         let request = RESTRequest(url: URL(string: "https://example.test/200")!, method: "GET")
 
-        _ = try await transport.response(for: request)
+        let response = try await transport.response(for: request)
 
+        #expect(response.statusCode == 200)
         #expect(delegate.didCompleteTask)
+        #expect(delegate.didReceiveResponse)
+        #expect(delegate.didReceiveData)
+        #expect(delegate.callbackSessionIdentities.contains(ObjectIdentifier(session)))
+        #expect(delegate.callbackSessionIdentities.count == 1)
+    }
+
+    @Test
+    func `sequential requests reuse the supplied session without invalidating it`() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ResponseLimitURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        let transport = URLSessionTransport(session: session)
+        let request = RESTRequest(url: URL(string: "https://example.test/200")!, method: "GET")
+
+        let first = try await transport.response(for: request)
+        let second = try await transport.response(for: request)
+
+        #expect(first.statusCode == 200)
+        #expect(second.statusCode == 200)
+        // Creating a task after the transport returns proves the supplied session was not
+        // finish-invalidated by the bounded loader.
+        let probe = session.dataTask(with: URL(string: "https://example.test/200")!)
+        defer { probe.cancel() }
+        #expect(probe.state == .suspended)
+    }
+
+    @Test
+    func `unsupported response dispositions are coerced to allow or cancel`() {
+        #expect(
+            BoundedURLSessionLoader.constrainedResponseDisposition(.allow) == .allow
+        )
+        #expect(
+            BoundedURLSessionLoader.constrainedResponseDisposition(.cancel) == .cancel
+        )
+        #expect(
+            BoundedURLSessionLoader.constrainedResponseDisposition(.becomeDownload) == .allow
+        )
+        #if !os(Linux)
+        #expect(
+            BoundedURLSessionLoader.constrainedResponseDisposition(.becomeStream) == .allow
+        )
+        #endif
+    }
+
+    @Test
+    func `a data delegate becomeDownload disposition still completes as data`() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ResponseLimitURLProtocol.self]
+        let delegate = BecomeDownloadDelegate()
+        let queue = OperationQueue()
+        queue.maxConcurrentOperationCount = 1
+        let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: queue)
+        let transport = URLSessionTransport(session: session)
+        let request = RESTRequest(url: URL(string: "https://example.test/200")!, method: "GET")
+
+        let response = try await transport.response(for: request)
+
+        #expect(response.statusCode == 200)
+        #expect(!response.data.isEmpty)
+        #expect(delegate.sawBecomeDownloadRequest)
+    }
+
+    #if !canImport(FoundationNetworking)
+    @Test
+    func `waiting for connectivity callbacks are forwarded to the supplied delegate`() {
+        let origin = URL(string: "https://example.test/connectivity")!
+        let spy = TransportDelegateSpy()
+        let redirectDelegate = SameOriginRedirectDelegate(
+            requestURL: origin,
+            forwardingDelegate: spy
+        )
+        let task = URLSession.shared.dataTask(with: origin)
+        defer { task.cancel() }
+
+        redirectDelegate.urlSession(URLSession.shared, taskIsWaitingForConnectivity: task)
+
+        #expect(spy.didWaitForConnectivity)
+    }
+
+    @Test
+    func `informational response callbacks are forwarded to the supplied delegate`() throws {
+        let origin = URL(string: "https://example.test/info")!
+        let spy = TransportDelegateSpy()
+        let redirectDelegate = SameOriginRedirectDelegate(
+            requestURL: origin,
+            forwardingDelegate: spy
+        )
+        let task = URLSession.shared.dataTask(with: origin)
+        defer { task.cancel() }
+        let informational = try #require(HTTPURLResponse(
+            url: origin,
+            statusCode: 103,
+            httpVersion: "HTTP/1.1",
+            headerFields: ["Link": "</hint>; rel=preload"]
+        ))
+
+        redirectDelegate.urlSession(
+            URLSession.shared,
+            task: task,
+            didReceiveInformationalResponse: informational
+        )
+
+        #expect(spy.didReceiveInformationalResponse)
+        #expect(spy.informationalStatusCode == 103)
     }
     #endif
 }
@@ -368,20 +472,85 @@ private struct ResponseLimitErrors: RESTTransportErrorMapping {
 
 private nonisolated struct ResponseLimitValue: Decodable, Sendable {}
 
-#if os(Linux)
-private final nonisolated class CompletionRecordingDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+private final nonisolated class TransportDelegateSpy: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private let lock = NSLock()
     private var completionRecorded = false
+    private var responseRecorded = false
+    private var dataRecorded = false
+    private var waitingRecorded = false
+    private var informationalRecorded = false
+    private var informationalStatus: Int?
+    private var sessionIdentities = Set<ObjectIdentifier>()
 
-    var didCompleteTask: Bool {
-        lock.withLock { completionRecorded }
+    var didCompleteTask: Bool { lock.withLock { completionRecorded } }
+    var didReceiveResponse: Bool { lock.withLock { responseRecorded } }
+    var didReceiveData: Bool { lock.withLock { dataRecorded } }
+    var didWaitForConnectivity: Bool { lock.withLock { waitingRecorded } }
+    var didReceiveInformationalResponse: Bool { lock.withLock { informationalRecorded } }
+    var informationalStatusCode: Int? { lock.withLock { informationalStatus } }
+    var callbackSessionIdentities: Set<ObjectIdentifier> { lock.withLock { sessionIdentities } }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask _: URLSessionDataTask,
+        didReceive _: URLResponse,
+        completionHandler: @escaping @Sendable (URLSession.ResponseDisposition) -> Void
+    ) {
+        lock.withLock {
+            responseRecorded = true
+            sessionIdentities.insert(ObjectIdentifier(session))
+        }
+        completionHandler(.allow)
     }
 
-    func urlSession(_: URLSession, task _: URLSessionTask, didCompleteWithError _: (any Error)?) {
-        lock.withLock { completionRecorded = true }
+    func urlSession(_ session: URLSession, dataTask _: URLSessionDataTask, didReceive _: Data) {
+        lock.withLock {
+            dataRecorded = true
+            sessionIdentities.insert(ObjectIdentifier(session))
+        }
+    }
+
+    func urlSession(_ session: URLSession, task _: URLSessionTask, didCompleteWithError _: (any Error)?) {
+        lock.withLock {
+            completionRecorded = true
+            sessionIdentities.insert(ObjectIdentifier(session))
+        }
+    }
+
+    #if !canImport(FoundationNetworking)
+    func urlSession(_: URLSession, taskIsWaitingForConnectivity _: URLSessionTask) {
+        lock.withLock { waitingRecorded = true }
+    }
+
+    func urlSession(
+        _: URLSession,
+        task _: URLSessionTask,
+        didReceiveInformationalResponse response: HTTPURLResponse
+    ) {
+        lock.withLock {
+            informationalRecorded = true
+            informationalStatus = response.statusCode
+        }
+    }
+    #endif
+}
+
+private final nonisolated class BecomeDownloadDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    private var requestedBecomeDownload = false
+
+    var sawBecomeDownloadRequest: Bool { lock.withLock { requestedBecomeDownload } }
+
+    func urlSession(
+        _: URLSession,
+        dataTask _: URLSessionDataTask,
+        didReceive _: URLResponse,
+        completionHandler: @escaping @Sendable (URLSession.ResponseDisposition) -> Void
+    ) {
+        lock.withLock { requestedBecomeDownload = true }
+        completionHandler(.becomeDownload)
     }
 }
-#endif
 
 private final nonisolated class ResponseLimitURLProtocol: URLProtocol {
     override static func canInit(with _: URLRequest) -> Bool { true }
