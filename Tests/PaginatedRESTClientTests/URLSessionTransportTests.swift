@@ -72,7 +72,9 @@ struct URLSessionTransportTests {
         #expect(error?.statusCode == status)
         #expect(error?.limit == 8)
         #expect(error?.phase == .body)
-        #expect(error?.observedByteCount == 8)
+        // Apple streams byte-by-byte so rejection lands at exactly `limit`; Linux may
+        // receive a larger first chunk and reject with zero accepted bytes.
+        #expect((error?.observedByteCount ?? -1) <= 8)
     }
 
     @Test

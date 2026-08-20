@@ -6,13 +6,11 @@ API breakage: constructor RESTRequest.init(url:method:headers:body:bodyFileURL:)
 API breakage: constructor RESTResponse.init(data:statusCode:headers:) is now with nonisolated
 API breakage: constructor RESTResponseTooLargeError.init(statusCode:limit:) has been removed
 API breakage: constructor RESTResponseTooLargeError.init(statusCode:limit:phase:declaredContentLength:observedByteCount:) has been added
-API breakage: enumelement RESTRequestBodyError.contentLengthMismatch(expected:declared:) has been added
+API breakage: enumelement RESTRequestBodyError.contentLengthMismatch has been added as a new enum case
+API breakage: var RESTResponse.headers is now with nonisolated
 API breakage: var RESTResponse.headers has been changed from public get/set stored to public get/set computed
 API breakage: enumelement RESTResponseOverflowPhase.headers has been added
 API breakage: enumelement RESTResponseOverflowPhase.body has been added
-API breakage: accessor RESTResponse.headers.Modify has been removed
-API breakage: accessor RESTResponse.headers.Get has been removed
-API breakage: accessor RESTResponse.headers.Set has been removed
 API breakage: var RESTResponseTooLargeError.phase has been added as a stored property
 API breakage: var RESTResponseTooLargeError.declaredContentLength has been added as a stored property
 API breakage: var RESTResponseTooLargeError.observedByteCount has been added as a stored property
@@ -28,8 +26,6 @@ API breakage: enum RESTResponseOverflowPhase has been added
 API breakage: func PaginatedRESTClient.performNoContent(request:) has been added
 API breakage: func PaginatedRESTClient.methodAllowsJSONBody(_:) has been added
 API breakage: func PaginatedRESTClient.honorsRetryAfter(statusCode:) has been added
-API breakage: func PaginatedRESTClient.utf8PrefixEndIndex(_:maxBytes:) has been added
-API breakage: func PaginatedRESTClient.pageCount(total:pageSize:) has been added
 API breakage: var PaginatedRESTClient.maxRetryDelay has been added as a static property
 API breakage: func RESTTransportErrorMapping.invalidRequest(_:) has been added as a default implementation
 API breakage: func RESTTransportErrorMapping.encode(_:) has been added as a default implementation
