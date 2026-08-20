@@ -63,6 +63,7 @@ public struct URLSessionTransport: RESTTransport {
             errorResponseLimit: errorResponseLimit,
             requestURL: urlRequest.url,
             bodyFileURL: request.bodyFileURL,
+            requiresSameOrigin: Self.requiresSameOrigin(urlRequest, bodyFileURL: request.bodyFileURL),
             forwardingDelegate: session.delegate
         ).load(
             configuration: session.configuration,
@@ -73,6 +74,7 @@ public struct URLSessionTransport: RESTTransport {
         let redirectDelegate = SameOriginRedirectDelegate(
             requestURL: urlRequest.url,
             bodyFileURL: request.bodyFileURL,
+            requiresSameOrigin: Self.requiresSameOrigin(urlRequest, bodyFileURL: request.bodyFileURL),
             forwardingDelegate: session.delegate
         )
         let (bytes, response) = try await session.bytes(for: urlRequest, delegate: redirectDelegate)
@@ -132,6 +134,17 @@ public struct URLSessionTransport: RESTTransport {
             urlRequest.httpBody = request.body
         }
         return urlRequest
+    }
+
+    private nonisolated static func requiresSameOrigin(
+        _ request: URLRequest,
+        bodyFileURL: URL?
+    ) -> Bool {
+        guard bodyFileURL == nil else { return true }
+        let sensitive = ["authorization", "cookie", "proxy-authorization"]
+        return (request.allHTTPHeaderFields ?? [:]).keys.contains {
+            sensitive.contains($0.lowercased())
+        }
     }
 
     /// Opens the body file for size validation, then attaches a fresh unopened stream.
@@ -272,6 +285,7 @@ final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecke
         errorResponseLimit: Int,
         requestURL: URL?,
         bodyFileURL: URL?,
+        requiresSameOrigin: Bool,
         forwardingDelegate: (any URLSessionDelegate)?
     ) {
         self.successResponseLimit = successResponseLimit
@@ -279,6 +293,7 @@ final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecke
         redirectDelegate = SameOriginRedirectDelegate(
             requestURL: requestURL,
             bodyFileURL: bodyFileURL,
+            requiresSameOrigin: requiresSameOrigin,
             forwardingDelegate: forwardingDelegate
         )
         self.forwardingDelegate = forwardingDelegate

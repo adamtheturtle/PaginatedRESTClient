@@ -20,16 +20,19 @@ final nonisolated class SameOriginRedirectDelegate: NSObject, URLSessionTaskDele
 
     private let requestOrigin: Origin?
     private let bodyFileURL: URL?
+    private let requiresSameOrigin: Bool
     private let sessionDelegate: (any URLSessionDelegate)?
     private let forwardingDelegate: (any URLSessionTaskDelegate)?
 
     init(
         requestURL: URL?,
         bodyFileURL: URL? = nil,
+        requiresSameOrigin: Bool = true,
         forwardingDelegate: (any URLSessionDelegate)?
     ) {
         requestOrigin = Self.origin(from: requestURL)
         self.bodyFileURL = bodyFileURL
+        self.requiresSameOrigin = requiresSameOrigin
         sessionDelegate = forwardingDelegate
         self.forwardingDelegate = forwardingDelegate as? any URLSessionTaskDelegate
     }
@@ -258,7 +261,18 @@ final nonisolated class SameOriginRedirectDelegate: NSObject, URLSessionTaskDele
         else {
             return false
         }
-        return requestOrigin == Self.origin(from: url)
+        guard ["http", "https"].contains(components.scheme?.lowercased()) else { return false }
+        if requiresSameOrigin || Self.containsSensitiveHeaders(request) {
+            return requestOrigin == Self.origin(from: url)
+        }
+        return true
+    }
+
+    private static func containsSensitiveHeaders(_ request: URLRequest) -> Bool {
+        let sensitive = ["authorization", "cookie", "proxy-authorization"]
+        return (request.allHTTPHeaderFields ?? [:]).keys.contains {
+            sensitive.contains($0.lowercased())
+        }
     }
 
     private static func origin(from url: URL?) -> Origin? {
