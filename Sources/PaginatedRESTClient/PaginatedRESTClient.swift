@@ -519,7 +519,9 @@ public struct PaginatedRESTClient {
         path: String,
         body: some Encodable
     ) async throws {
-        try await performNoContent(request: try makeSendRequest(method: method, path: path, body: body))
+        try await performNoContentWithRetry(
+            request: try makeSendRequest(method: method, path: path, body: body)
+        )
     }
 
     /// Sends an authenticated request without a body.
@@ -533,7 +535,9 @@ public struct PaginatedRESTClient {
 
     /// Sends an authenticated request without a body when the response has no model.
     public nonisolated func send(method: String, path: String) async throws {
-        try await performNoContent(request: try authorizedRequest(method: method, path: path))
+        try await performNoContentWithRetry(
+            request: try authorizedRequest(method: method, path: path)
+        )
     }
 
     /// Sends an authenticated request whose body is streamed from a local file.
@@ -555,7 +559,7 @@ public struct PaginatedRESTClient {
         path: String,
         bodyFileURL: URL
     ) async throws {
-        try await performNoContent(
+        try await performNoContentWithRetry(
             request: try authorizedRequest(method: method, path: path, bodyFileURL: bodyFileURL)
         )
     }

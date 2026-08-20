@@ -127,6 +127,30 @@ struct RedirectPolicyTests {
     }
     #endif
 
+    @Test(arguments: [
+        "https://user@api.example.test/v2/resources",
+        "https://user:password@api.example.test/v2/resources"
+    ])
+    func `same-origin redirects with userinfo are rejected`(destination: String) async throws {
+        let origin = URL(string: "https://api.example.test/v1/resources")!
+        let delegate = SameOriginRedirectDelegate(requestURL: origin, forwardingDelegate: nil)
+        let task = URLSession.shared.dataTask(with: origin)
+        defer { task.cancel() }
+        let response = try #require(HTTPURLResponse(
+            url: origin,
+            statusCode: 302,
+            httpVersion: "HTTP/1.1",
+            headerFields: nil
+        ))
+        let rejected = await redirectDecision(
+            from: delegate,
+            task: task,
+            response: response,
+            request: URLRequest(url: URL(string: destination)!)
+        )
+        #expect(rejected == nil)
+    }
+
     private func redirectDecision(
         from delegate: SameOriginRedirectDelegate,
         task: URLSessionTask,

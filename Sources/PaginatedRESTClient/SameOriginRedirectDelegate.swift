@@ -236,12 +236,21 @@ final nonisolated class SameOriginRedirectDelegate: NSObject, URLSessionTaskDele
     }
 
     private func allows(_ request: URLRequest) -> Bool {
-        requestOrigin == Self.origin(from: request.url)
+        guard let url = request.url,
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              components.user == nil,
+              components.password == nil
+        else {
+            return false
+        }
+        return requestOrigin == Self.origin(from: url)
     }
 
     private static func origin(from url: URL?) -> Origin? {
         guard let url,
               let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              components.user == nil,
+              components.password == nil,
               let scheme = components.scheme?.lowercased(),
               let rawHost = components.host?.lowercased(),
               let port = components.port ?? defaultPort(for: scheme)

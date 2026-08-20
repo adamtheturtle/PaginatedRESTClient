@@ -60,7 +60,7 @@ struct APIErrors: RESTTransportErrorMapping {
     }
 }
 
-let client = PaginatedRESTClient(
+let client = try PaginatedRESTClient(
     apiKey: token,
     baseURL: URL(string: "https://api.example.com")!,
     decoderFactory: { JSONDecoder() },

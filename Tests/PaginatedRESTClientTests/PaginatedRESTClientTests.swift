@@ -835,6 +835,17 @@ extension PaginatedRESTClientTests {
         #expect(captured.values.count == 1)
     }
 
+    @Test(arguments: [" ", "\t", "\n", "  \t\n"])
+    func `whitespace-only next page terminates the walk without an error`(nextPage: String) async throws {
+        let captured = CapturedRequests()
+        let client = makeClient(transport: NextPageTransport(nextPage: nextPage, captured: captured))
+
+        let items = try await client.fetchAllPages(Unidentified.self, path: "/things/")
+
+        #expect(items == [Thing(id: 1)])
+        #expect(captured.values.count == 1)
+    }
+
     @Test(arguments: ["http://[::1", "https://"])
     func `an invalid initial next page fails instead of truncating`(nextPage: String) async throws {
         let captured = CapturedRequests()
@@ -988,6 +999,74 @@ struct RateLimitRetryTests {
         #expect(PaginatedRESTClient.retryAfterDelay("not a date", relativeTo: now) == nil)
         #expect(PaginatedRESTClient.retryAfterDelay("-1", relativeTo: now) == nil)
         #expect(PaginatedRESTClient.retryAfterDelay(String(repeating: "9", count: 400), relativeTo: now) == nil)
+    }
+
+    @Test
+    func `rejects malformed Retry-After HTTP dates`() throws {
+        var components = DateComponents()
+        components.calendar = Calendar(identifier: .gregorian)
+        components.timeZone = TimeZone(secondsFromGMT: 0)
+        components.year = 1994
+        components.month = 11
+        components.day = 6
+        components.hour = 8
+        components.minute = 49
+        components.second = 7
+        let now = try #require(components.date)
+
+        #expect(PaginatedRESTClient.retryAfterDelay(
+            "Wed, 21 Oct 2015 07:28:00 PST", relativeTo: now
+        ) == nil)
+        #expect(PaginatedRESTClient.retryAfterDelay(
+            "Wed, 1 Oct 2015 07:28:00 GMT", relativeTo: now
+        ) == nil)
+        #expect(PaginatedRESTClient.retryAfterDelay(
+            "Mon, 06 Nov 1994 08:49:37 GMT", relativeTo: now
+        ) == nil)
+    }
+
+    @Test
+    func `RFC850 two-digit years follow the fifty-year window`() throws {
+        var components = DateComponents()
+        components.calendar = Calendar(identifier: .gregorian)
+        components.timeZone = TimeZone(secondsFromGMT: 0)
+        components.year = 2026
+        components.month = 8
+        components.day = 20
+        components.hour = 12
+        let now = try #require(components.date)
+
+        #expect(PaginatedRESTClient.interpretTwoDigitYear(70, relativeTo: now) == 2070)
+        #expect(PaginatedRESTClient.interpretTwoDigitYear(80, relativeTo: now) == 1980)
+
+        let delay = PaginatedRESTClient.retryAfterDelay(
+            "Sunday, 02-Nov-70 08:49:37 GMT",
+            relativeTo: now
+        )
+        #expect(delay != nil)
+        #expect(delay! > 60 * 60 * 24 * 365) // well into the future (2070)
+    }
+
+    @Test
+    func `public initializer rejects invalid base URLs`() async {
+        await #expect(throws: TestErrors.Failure.invalidRequest) {
+            _ = try PaginatedRESTClient(
+                apiKey: "key",
+                baseURL: URL(string: "file:///tmp")!,
+                decoderFactory: { JSONDecoder() },
+                encoderFactory: { JSONEncoder() },
+                errors: TestErrors()
+            )
+        }
+        await #expect(throws: TestErrors.Failure.invalidRequest) {
+            _ = try PaginatedRESTClient(
+                apiKey: "key",
+                baseURL: URL(string: "https://user@example.test")!,
+                decoderFactory: { JSONDecoder() },
+                encoderFactory: { JSONEncoder() },
+                errors: TestErrors()
+            )
+        }
     }
 
     @Test
@@ -1823,6 +1902,15 @@ struct ClientIssueRegressionTests {
             return
         }
         #expect(detail.contains("at $"))
+    }
+
+    @Test
+    func `performNoContentWithRetry retries transient 503 responses`() async throws {
+        let transport = RetryOnceTransport(retryAfter: "0", status: 503)
+        let client = makeClient(transport: transport)
+        let request = try client.authorizedRequest(method: "DELETE", path: "/things/1")
+        try await client.performNoContentWithRetry(request: request, maxAttempts: 3)
+        #expect(transport.requestCount == 2)
     }
 
     @Test
