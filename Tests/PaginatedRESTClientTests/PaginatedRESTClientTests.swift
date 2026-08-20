@@ -682,7 +682,7 @@ struct PaginatedRESTClientTests {
             #expect(query.filter { $0.name == "version" }.map(\.value) == ["2"])
             #expect(query.filter { $0.name == "sort" }.map(\.value) == ["new"])
         }
-        #expect(captured.values.first?.url.query?.contains("page=99") == true)
+        #expect(captured.values.first?.url.query?.contains("page=") == false)
         #expect(captured.values.last?.url.query?.contains("page=2") == true)
     }
 
@@ -1410,34 +1410,20 @@ struct PaginationIssueRegressionTests {
     }
 
     @Test
-    func `an intentional initial page query is preserved on the first request`() async throws {
+    func `an intentional initial page query is replaced on the first pagination request`() async throws {
         let captured = CapturedRequests()
         let base = try #require(URL(string: "https://example.test/things?page=5"))
-        let client = makeClient(
-            transport: FixedFirstPageTransport(
-                json: #"{"things":[{"id":50}],"next_page":null,"total":1}"#
-            ),
-            baseURL: base
-        )
-        // Wrap to capture: FixedFirstPage doesn't record; use a capturing wrapper.
-        let capturing = QueryCaptureTransport(captured: captured)
-        let client2 = makeClient(
-            transport: capturing,
-            baseURL: base
-        )
-        // QueryCaptureTransport uses StubTransport which needs page 1/2 - use sequential JSON instead.
         let seq = SequentialJSONTransport(
             pages: [#"{"things":[{"id":50}],"next_page":null,"total":null}"#],
             captured: captured
         )
-        let client3 = makeClient(transport: seq, baseURL: base)
-        let items = try await client3.fetchAllPages(Unidentified.self, path: "")
+        let items = try await makeClient(transport: seq, baseURL: base)
+            .fetchAllPages(Unidentified.self, path: "")
         #expect(items == [Thing(id: 50)])
         let page = URLComponents(url: try #require(captured.values.first?.url), resolvingAgainstBaseURL: false)?
             .queryItems?.first { $0.name == "page" }?.value
-        #expect(page == "5")
-        _ = client
-        _ = client2
+        // Parallel/sequential page construction owns `page`; a stale base query must not stick.
+        #expect(page == nil)
     }
 
     @Test
@@ -1653,6 +1639,8 @@ struct ClientIssueRegressionTests {
         #expect(text.contains("�") == false)
         #expect(text.hasSuffix(" [truncated]"))
         #expect(PaginatedRESTClient.utf8PrefixEndIndex(Data([0x41, 0xC3, 0xA9]), maxBytes: 2) == 1)
+        // Full "é" still fits when maxBytes lands on its final byte.
+        #expect(PaginatedRESTClient.utf8PrefixEndIndex(Data([0x41, 0xC3, 0xA9, 0x42]), maxBytes: 3) == 3)
     }
 
     @Test

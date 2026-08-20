@@ -716,9 +716,12 @@ extension PaginatedRESTClient {
         case 0xF0 ..< 0xF8: needed = 4
         default: needed = 1
         }
-        // Incomplete sequence at the cut: drop the lead byte.
+        // Incomplete sequence at the cut: drop the lead. Otherwise advance past the
+        // complete scalar that starts at `end - 1` (which may still fit in `maxBytes`).
         if end - 1 + needed > maxBytes {
             end -= 1
+        } else {
+            end = end - 1 + needed
         }
         return end
     }
@@ -908,8 +911,9 @@ nonisolated func drivePagination<W: PagedResponse>(
 
     /// Builds `…/path?sort=…&page=N`. Page numbers are constructed here
     /// rather than taken from `next_page` so the parallel fetch is
-    /// fully deterministic. An intentional initial `page` query on the
-    /// configured URL is preserved when no replacement page is supplied.
+    /// fully deterministic. Any pre-existing `page` query is replaced (or
+    /// removed for the first request) so parallel numbering always treats the
+    /// first response as page 1.
     func pageURL(_ page: Int?) -> URL? {
         var comps = URLComponents(url: baseURL.appending(path: path), resolvingAgainstBaseURL: false)
         var query = comps?.queryItems ?? []
@@ -917,8 +921,8 @@ nonisolated func drivePagination<W: PagedResponse>(
             query.removeAll { $0.name.compare("sort", options: .caseInsensitive) == .orderedSame }
             query.append(URLQueryItem(name: "sort", value: sort))
         }
+        query.removeAll { $0.name.compare("page", options: .caseInsensitive) == .orderedSame }
         if let page {
-            query.removeAll { $0.name.compare("page", options: .caseInsensitive) == .orderedSame }
             query.append(URLQueryItem(name: "page", value: String(page)))
         }
         comps?.queryItems = query.isEmpty ? nil : query

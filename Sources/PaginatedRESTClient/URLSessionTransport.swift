@@ -120,8 +120,8 @@ public struct URLSessionTransport: RESTTransport {
         return urlRequest
     }
 
-    /// Opens the body file first, then derives or validates `Content-Length` from the
-    /// opened path's size so a stale header cannot diverge from the stream that is sent.
+    /// Opens the body file for size validation, then attaches a fresh unopened stream.
+    /// URLSession opens and may replay `httpBodyStream` itself; a pre-opened stream is unsafe.
     private nonisolated static func attachFileBody(
         _ bodyFileURL: URL,
         to urlRequest: inout URLRequest
@@ -129,35 +129,36 @@ public struct URLSessionTransport: RESTTransport {
         guard bodyFileURL.isFileURL else {
             throw RESTRequestBodyError.bodyFileMustBeFileURL(bodyFileURL)
         }
-        // Open before the readability/size check so validation and the stream share one
-        // open attempt rather than a separate TOCTOU probe via `isReadableFile`.
-        guard let stream = InputStream(url: bodyFileURL) else {
+        // Open a short-lived handle to prove the path is readable and to read size from the
+        // same open, then close it before handing URLSession an unopened stream.
+        guard let probe = InputStream(url: bodyFileURL) else {
             throw RESTRequestBodyError.unreadableBodyFile(bodyFileURL)
         }
-        stream.open()
-        guard stream.streamStatus != .error else {
-            stream.close()
+        probe.open()
+        let probeFailed = probe.streamStatus == .error
+        probe.close()
+        guard !probeFailed else {
             throw RESTRequestBodyError.unreadableBodyFile(bodyFileURL)
         }
         let attributes: [FileAttributeKey: Any]
         do {
             attributes = try FileManager.default.attributesOfItem(atPath: bodyFileURL.path)
         } catch {
-            stream.close()
             throw RESTRequestBodyError.unreadableBodyFile(bodyFileURL)
         }
         guard let sizeNumber = attributes[.size] as? NSNumber else {
-            stream.close()
             throw RESTRequestBodyError.unreadableBodyFile(bodyFileURL)
         }
         let fileSize = sizeNumber.intValue
         if let declared = urlRequest.value(forHTTPHeaderField: "Content-Length") {
             guard declared == String(fileSize) else {
-                stream.close()
                 throw RESTRequestBodyError.contentLengthMismatch(expected: fileSize, declared: declared)
             }
         } else {
             urlRequest.setValue(String(fileSize), forHTTPHeaderField: "Content-Length")
+        }
+        guard let stream = InputStream(url: bodyFileURL) else {
+            throw RESTRequestBodyError.unreadableBodyFile(bodyFileURL)
         }
         urlRequest.httpBodyStream = stream
     }
@@ -405,10 +406,9 @@ final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecke
 }
 
 extension BoundedURLSessionLoader {
-    func urlSession(_ session: URLSession, didBecomeInvalidWithError error: (any Error)?) {
-        // Forward invalidation for the per-request session that actually ran the load.
-        redirectDelegate.urlSession(session, didBecomeInvalidWithError: error)
-    }
+    // Intentionally do not forward `urlSession(_:didBecomeInvalidWithError:)`.
+    // This loader owns a per-request session; telling the caller's delegate that *their*
+    // session was invalidated would tear down shared networking after one request.
 
     func urlSession(
         _ session: URLSession,
