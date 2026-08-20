@@ -29,10 +29,11 @@ public struct URLSessionTransport: RESTTransport {
         successResponseLimit: Int = 10 * 1024 * 1024,
         errorResponseLimit: Int = 64 * 1024
     ) {
-        precondition(successResponseLimit >= 0 && errorResponseLimit >= 0, "Response limits must not be negative")
         self.session = session
-        self.successResponseLimit = successResponseLimit
-        self.errorResponseLimit = errorResponseLimit
+        // Limits commonly come from user configuration. A negative value must not crash
+        // the host process; treating it as zero is the safest bounded interpretation.
+        self.successResponseLimit = max(0, successResponseLimit)
+        self.errorResponseLimit = max(0, errorResponseLimit)
     }
 
     public nonisolated func data(for request: RESTRequest) async throws -> (Data, Int) {
@@ -67,7 +68,11 @@ public struct URLSessionTransport: RESTTransport {
             throw URLError(.badServerResponse)
         }
         let limit = (200 ..< 300).contains(http.statusCode) ? successResponseLimit : errorResponseLimit
-        let declared = http.expectedContentLength >= 0 ? http.expectedContentLength : nil
+        // HEAD is explicitly bodyless. Its Content-Length describes the corresponding GET
+        // representation, rather than bytes transferred by this response.
+        let declared = request.method == "HEAD" ? nil : (
+            http.expectedContentLength >= 0 ? http.expectedContentLength : nil
+        )
         guard declared.map({ $0 <= Int64(limit) }) ?? true else {
             throw RESTResponseTooLargeError(
                 statusCode: http.statusCode,
@@ -94,10 +99,7 @@ public struct URLSessionTransport: RESTTransport {
             }
             data.append(byte)
         }
-        let headers = http.allHeaderFields.reduce(into: [String: String]()) { result, field in
-            let name = (field.key as? String) ?? String(describing: field.key)
-            result[name] = String(describing: field.value)
-        }
+        let headers = Self.responseHeaders(from: http)
         return RESTResponse(data: data, statusCode: http.statusCode, headers: headers)
         #endif
     }
@@ -127,17 +129,6 @@ public struct URLSessionTransport: RESTTransport {
         guard bodyFileURL.isFileURL else {
             throw RESTRequestBodyError.bodyFileMustBeFileURL(bodyFileURL)
         }
-        // Open a short-lived handle to prove the path is readable and to read size from the
-        // same open, then close it before handing URLSession an unopened stream.
-        guard let probe = InputStream(url: bodyFileURL) else {
-            throw RESTRequestBodyError.unreadableBodyFile(bodyFileURL)
-        }
-        probe.open()
-        let probeFailed = probe.streamStatus == .error
-        probe.close()
-        guard !probeFailed else {
-            throw RESTRequestBodyError.unreadableBodyFile(bodyFileURL)
-        }
         let attributes: [FileAttributeKey: Any]
         do {
             attributes = try FileManager.default.attributesOfItem(atPath: bodyFileURL.path)
@@ -145,6 +136,22 @@ public struct URLSessionTransport: RESTTransport {
             throw RESTRequestBodyError.unreadableBodyFile(bodyFileURL)
         }
         guard let sizeNumber = attributes[.size] as? NSNumber else {
+            throw RESTRequestBodyError.unreadableBodyFile(bodyFileURL)
+        }
+        // `attributesOfItem` follows symlinks, intentionally allowing a symlink to a
+        // regular readable file while rejecting directories, devices, and other streams.
+        guard attributes[.type] as? FileAttributeType == .typeRegular else {
+            throw RESTRequestBodyError.unreadableBodyFile(bodyFileURL)
+        }
+        // Open a short-lived handle to prove the regular file is readable, then close it
+        // before handing URLSession an unopened stream.
+        guard let probe = InputStream(url: bodyFileURL) else {
+            throw RESTRequestBodyError.unreadableBodyFile(bodyFileURL)
+        }
+        probe.open()
+        let probeFailed = probe.streamStatus == .error
+        probe.close()
+        guard !probeFailed else {
             throw RESTRequestBodyError.unreadableBodyFile(bodyFileURL)
         }
         let fileSize = sizeNumber.intValue
@@ -159,6 +166,17 @@ public struct URLSessionTransport: RESTTransport {
             throw RESTRequestBodyError.unreadableBodyFile(bodyFileURL)
         }
         urlRequest.httpBodyStream = stream
+    }
+
+    /// Uses HTTPURLResponse's string accessor instead of debug descriptions of bridged
+    /// values (such as NSArray), which can add quotes and brackets not present on the wire.
+    private nonisolated static func responseHeaders(from response: HTTPURLResponse) -> [String: String] {
+        response.allHeaderFields.reduce(into: [String: String]()) { result, field in
+            guard let name = field.key as? String,
+                  let value = response.value(forHTTPHeaderField: name)
+            else { return }
+            result[name] = value
+        }
     }
 }
 
@@ -290,7 +308,9 @@ final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecke
             return
         }
         let limit = (200 ..< 300).contains(http.statusCode) ? successResponseLimit : errorResponseLimit
-        let declared = http.expectedContentLength >= 0 ? http.expectedContentLength : nil
+        let declared = dataTask.originalRequest?.httpMethod == "HEAD" ? nil : (
+            http.expectedContentLength >= 0 ? http.expectedContentLength : nil
+        )
         guard declared.map({ $0 <= Int64(limit) }) ?? true else {
             completionHandler(.cancel)
             complete(.failure(RESTResponseTooLargeError(
@@ -357,10 +377,7 @@ final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecke
         }
         let result = lock.withLock { () -> RESTResponse? in
             guard let response = state.response else { return nil }
-            let headers = response.allHeaderFields.reduce(into: [String: String]()) { result, field in
-                let name = (field.key as? String) ?? String(describing: field.key)
-                result[name] = String(describing: field.value)
-            }
+            let headers = URLSessionTransport.responseHeaders(from: response)
             return RESTResponse(data: state.data, statusCode: response.statusCode, headers: headers)
         }
         complete(result.map(Result.success) ?? .failure(URLError(.badServerResponse)))

@@ -1682,6 +1682,71 @@ private struct BroadlyTransientErrors: RESTTransportErrorMapping {
 @Suite("Client open-issue regressions")
 struct ClientIssueRegressionTests {
     @Test
+    func `fetch merges per-request headers and preserves protected authorization`() async throws {
+        let captured = CapturedRequests()
+        let client = makeClient(
+            transport: CapturingFixedTransport(
+                inner: FixedResponseTransport(data: Data(#"{"id":1}"#.utf8), status: 200),
+                captured: captured
+            )
+        )
+
+        _ = try await client.fetch(
+            Thing.self,
+            path: "/things?state=open",
+            headers: [
+                "If-None-Match": "\"v1\"",
+                "Authorization": "Bearer attacker",
+                "Accept": "application/vnd.example+json"
+            ]
+        )
+
+        #expect(captured.values.count == 1)
+        let request = try #require(captured.values.first)
+        #expect(request.url.path == "/things")
+        #expect(URLComponents(url: request.url, resolvingAgainstBaseURL: false)?
+            .queryItems?.first(where: { $0.name == "state" })?.value == "open")
+        #expect(request.headers["If-None-Match"] == "\"v1\"")
+        #expect(request.headers["Accept"] == "application/vnd.example+json")
+        #expect(request.headers["Authorization"] == "Bearer test-key")
+    }
+
+    @Test
+    func `empty paths preserve the configured route exactly`() async throws {
+        let captured = CapturedRequests()
+        let base = try #require(URL(string: "https://example.test/api"))
+        let client = makeClient(
+            transport: CapturingFixedTransport(
+                inner: FixedResponseTransport(data: Data(#"{"id":1}"#.utf8), status: 200),
+                captured: captured
+            ),
+            baseURL: base
+        )
+
+        _ = try await client.fetch(Thing.self, path: "")
+        #expect(captured.values.first?.url == base)
+    }
+
+    @Test
+    func `send treats a path query as a query instead of path text`() async throws {
+        let captured = CapturedRequests()
+        let client = makeClient(
+            transport: CapturingFixedTransport(
+                inner: FixedResponseTransport(data: Data(#"{"id":1}"#.utf8), status: 200),
+                captured: captured
+            )
+        )
+
+        _ = try await client.send(Thing.self, method: "POST", path: "/things?dry_run=true", body: ["id": 1])
+        #expect(captured.values.count == 1)
+        let request = try #require(captured.values.first)
+        #expect(request.url.path == "/things")
+        #expect(request.url.absoluteString.contains("%3F") == false)
+        #expect(URLComponents(url: request.url, resolvingAgainstBaseURL: false)?
+            .queryItems?.first(where: { $0.name == "dry_run" })?.value == "true")
+    }
+
+    @Test
     func `authorized request builds bodyless and file-backed requests safely`() throws {
         let client = makeClient()
         let headers = ["Authorization": "Bearer attacker", "X-Request-ID": "abc"]

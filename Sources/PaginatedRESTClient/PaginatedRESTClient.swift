@@ -324,10 +324,17 @@ public struct PaginatedRESTClient {
         )
     }
 
-    public nonisolated func fetch<T: Decodable & Sendable>(_ type: T.Type, path: String) async throws -> T {
+    public nonisolated func fetch<T: Decodable & Sendable>(
+        _ type: T.Type,
+        path: String,
+        headers: [String: String] = [:]
+    ) async throws -> T {
         guard !apiKey.isEmpty else { throw errors.missingAPIKey() }
 
-        return try await performWithRetry(type, request: try authorizedGET(baseURL.appending(path: path)))
+        return try await performWithRetry(
+            type,
+            request: try authorizedGET(try url(forPath: path), headers: headers)
+        )
     }
 
     /// Accumulates every page of a paginated list endpoint. Convenience over
@@ -875,7 +882,7 @@ public extension PaginatedRESTClient {
         bodyFileURL: URL? = nil
     ) throws -> RESTRequest {
         guard !apiKey.isEmpty else { throw errors.missingAPIKey() }
-        let url = try validatedAuthenticatedURL(baseURL.appending(path: path))
+        let url = try validatedAuthenticatedURL(try url(forPath: path))
         var authenticatedHeaders = headers.filter {
             $0.key.compare("Authorization", options: .caseInsensitive) != .orderedSame
         }
@@ -898,13 +905,22 @@ public extension PaginatedRESTClient {
 
     /// Builds an authenticated GET only for the configured origin. This method throws
     /// rather than placing bearer credentials on an arbitrary caller-provided URL.
-    nonisolated func authorizedGET(_ url: URL) throws -> RESTRequest {
+    nonisolated func authorizedGET(_ url: URL, headers: [String: String] = [:]) throws -> RESTRequest {
         guard !apiKey.isEmpty else { throw errors.missingAPIKey() }
         let validated = try validatedAuthenticatedURL(url)
+        var authenticatedHeaders = headers.filter {
+            $0.key.compare("Authorization", options: .caseInsensitive) != .orderedSame
+        }
+        if !authenticatedHeaders.keys.contains(where: {
+            $0.compare("Accept", options: .caseInsensitive) == .orderedSame
+        }) {
+            authenticatedHeaders["Accept"] = "application/json"
+        }
+        authenticatedHeaders["Authorization"] = "Bearer \(apiKey)"
         let request = RESTRequest(
             url: validated,
             method: "GET",
-            headers: ["Authorization": "Bearer \(apiKey)", "Accept": "application/json"]
+            headers: authenticatedHeaders
         )
         try request.validate()
         return request
@@ -920,6 +936,30 @@ public extension PaginatedRESTClient {
         else {
             throw errors.invalidRequest("Authenticated URL left the configured origin")
         }
+        return url
+    }
+
+    /// Resolves the public `path` argument as a path reference, preserving the configured
+    /// base URL unchanged for an empty reference and merging a supplied query separately.
+    /// `URL.appending(path:)` cannot do this because it percent-encodes `?` as path data.
+    nonisolated func url(forPath path: String) throws -> URL {
+        guard !path.isEmpty else { return baseURL }
+        guard let reference = URLComponents(string: path),
+              reference.scheme == nil,
+              reference.host == nil,
+              reference.user == nil,
+              reference.password == nil
+        else {
+            throw errors.invalidRequest("Path must be a relative path reference")
+        }
+        let appended = baseURL.appending(path: reference.path)
+        guard var components = URLComponents(url: appended, resolvingAgainstBaseURL: false) else {
+            throw errors.invalidRequest("Invalid URL")
+        }
+        components.queryItems = (components.queryItems ?? []) + (reference.queryItems ?? [])
+        // A fragment is never sent over HTTP and must not silently alter URL construction.
+        components.fragment = nil
+        guard let url = components.url else { throw errors.invalidRequest("Invalid URL") }
         return url
     }
 
@@ -1011,7 +1051,8 @@ nonisolated func drivePagination<W: PagedResponse>(
     /// removed for the first request) so parallel numbering always treats the
     /// first response as page 1.
     func pageURL(_ page: Int?) -> URL? {
-        var comps = URLComponents(url: baseURL.appending(path: path), resolvingAgainstBaseURL: false)
+        guard let endpoint = try? url(forPath: path) else { return nil }
+        var comps = URLComponents(url: endpoint, resolvingAgainstBaseURL: false)
         var query = comps?.queryItems ?? []
         if let sort {
             query.removeAll { $0.name.compare("sort", options: .caseInsensitive) == .orderedSame }
