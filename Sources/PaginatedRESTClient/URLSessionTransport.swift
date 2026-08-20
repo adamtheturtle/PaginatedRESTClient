@@ -285,7 +285,7 @@ final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecke
         errorResponseLimit: Int,
         requestURL: URL?,
         bodyFileURL: URL?,
-        requiresSameOrigin: Bool,
+        requiresSameOrigin: Bool = true,
         forwardingDelegate: (any URLSessionDelegate)?
     ) {
         self.successResponseLimit = successResponseLimit
