@@ -12,6 +12,7 @@ private struct TestErrors: RESTTransportErrorMapping {
         case http(Int)
         case decode
         case network
+        case invalidRequest
     }
 
     nonisolated func missingAPIKey() -> Error {
@@ -30,6 +31,10 @@ private struct TestErrors: RESTTransportErrorMapping {
         Failure.network
     }
 
+    nonisolated func invalidRequest(_: String) -> Error {
+        Failure.invalidRequest
+    }
+
     nonisolated func isTransient(_ error: Error) -> Bool {
         if case let .http(code) = error as? Failure {
             return (500 ... 599).contains(code) || code == 429 || code == 0
@@ -41,6 +46,8 @@ private struct TestErrors: RESTTransportErrorMapping {
 private enum DetailedFailure: Error, Equatable {
     case http(Int, String)
     case decode(String)
+    case invalidRequest(String)
+    case encode(String)
     case unexpected
 }
 
@@ -49,6 +56,8 @@ private struct DetailedErrors: RESTTransportErrorMapping {
     nonisolated func http(status: Int, body: String) -> any Error { DetailedFailure.http(status, body) }
     nonisolated func decode(_ detail: String) -> any Error { DetailedFailure.decode(detail) }
     nonisolated func network(_: URLError) -> any Error { DetailedFailure.unexpected }
+    nonisolated func invalidRequest(_ detail: String) -> any Error { DetailedFailure.invalidRequest(detail) }
+    nonisolated func encode(_ detail: String) -> any Error { DetailedFailure.encode(detail) }
     nonisolated func isTransient(_: any Error) -> Bool { false }
 }
 
@@ -400,9 +409,11 @@ private nonisolated final class RetryOnceTransport: RESTTransport, @unchecked Se
     private let lock = NSLock()
     private var attempts = 0
     let retryAfter: String?
+    let status: Int
 
-    init(retryAfter: String?) {
+    init(retryAfter: String?, status: Int = 429) {
         self.retryAfter = retryAfter
+        self.status = status
     }
 
     func data(for request: RESTRequest) async throws -> (Data, Int) {
@@ -418,7 +429,7 @@ private nonisolated final class RetryOnceTransport: RESTTransport, @unchecked Se
         if attempt == 1 {
             return RESTResponse(
                 data: Data("limited".utf8),
-                statusCode: 429,
+                statusCode: status,
                 headers: retryAfter.map { ["rEtRy-AfTeR": $0] } ?? [:]
             )
         }
@@ -531,7 +542,9 @@ private nonisolated final class ConcurrentRateLimitTransport: RESTTransport, @un
 private func makeClient(
     transport: any RESTTransport = StubTransport(),
     baseURL: URL = URL(string: "https://example.test")!,
-    retryRuntime: RetryRuntime = .live
+    retryRuntime: RetryRuntime = .live,
+    maxSequentialPages: Int = PaginatedRESTClient.defaultMaxSequentialPages,
+    maxParallelPages: Int = PaginatedRESTClient.defaultMaxParallelPages
 ) -> PaginatedRESTClient {
     PaginatedRESTClient(
         apiKey: "test-key",
@@ -540,7 +553,9 @@ private func makeClient(
         decoderFactory: { JSONDecoder() },
         encoderFactory: { JSONEncoder() },
         errors: TestErrors(),
-        retryRuntime: retryRuntime
+        retryRuntime: retryRuntime,
+        maxSequentialPages: maxSequentialPages,
+        maxParallelPages: maxParallelPages
     )
 }
 
@@ -734,7 +749,7 @@ extension PaginatedRESTClientTests {
         "https://user@example.test/things/"
     ])
     func `public authorization rejects URLs outside the configured origin`(value: String) throws {
-        #expect(throws: TestErrors.Failure.http(0)) {
+        #expect(throws: TestErrors.Failure.invalidRequest) {
             _ = try makeClient().authorizedGET(#require(URL(string: value)))
         }
     }
@@ -751,7 +766,7 @@ extension PaginatedRESTClientTests {
         let captured = CapturedRequests()
         let client = makeClient(transport: NextPageTransport(nextPage: nextPage, captured: captured))
 
-        await #expect(throws: TestErrors.Failure.http(0)) {
+        await #expect(throws: TestErrors.Failure.invalidRequest) {
             _ = try await client.fetchAllPages(Unidentified.self, path: "/things/")
         }
 
@@ -793,7 +808,7 @@ extension PaginatedRESTClientTests {
         let captured = CapturedRequests()
         let client = makeClient(transport: NextPageTransport(nextPage: nextPage, captured: captured))
 
-        await #expect(throws: TestErrors.Failure.http(0)) {
+        await #expect(throws: TestErrors.Failure.invalidRequest) {
             _ = try await client.fetchAllPages(Unidentified.self, path: "/things/")
         }
 
@@ -809,7 +824,7 @@ extension PaginatedRESTClientTests {
             captured: captured
         )
 
-        await #expect(throws: TestErrors.Failure.http(0)) {
+        await #expect(throws: TestErrors.Failure.invalidRequest) {
             _ = try await makeClient(transport: transport)
                 .fetchAllPages(Unidentified.self, path: "/things/")
         }
@@ -823,7 +838,7 @@ extension PaginatedRESTClientTests {
         let client = makeClient(transport: CycleTransport(kind: .selfLoop, captured: captured))
         var snapshots: [[Thing]] = []
 
-        await #expect(throws: TestErrors.Failure.http(0)) {
+        await #expect(throws: TestErrors.Failure.invalidRequest) {
             for try await snapshot in client.streamAllPages(Unidentified.self, path: "/things/") {
                 snapshots.append(snapshot)
             }
@@ -839,7 +854,7 @@ extension PaginatedRESTClientTests {
         let client = makeClient(transport: CycleTransport(kind: .twoPages, captured: captured))
         var snapshots: [[Thing]] = []
 
-        await #expect(throws: TestErrors.Failure.http(0)) {
+        await #expect(throws: TestErrors.Failure.invalidRequest) {
             for try await snapshot in client.streamAllPages(Unidentified.self, path: "/things/") {
                 snapshots.append(snapshot)
             }
@@ -1186,19 +1201,26 @@ struct PageCountTests {
     @Test
     func `an implausible total is capped rather than amplified into thousands of requests`() async throws {
         let log = RequestLog()
-        let transport = ScriptedTransport(pages: [Array(1 ... 10)], total: 50000, outOfRange: .notFound, log: log)
-        await #expect(throws: TestErrors.Failure.http(0)) {
+        // Two pages so page 1 advertises next_page and the parallel path evaluates `total`.
+        let transport = ScriptedTransport(
+            pages: [Array(1 ... 10), Array(11 ... 20)],
+            total: 50000,
+            outOfRange: .notFound,
+            log: log
+        )
+        await #expect(throws: TestErrors.Failure.invalidRequest) {
             _ = try await makeClient(transport: transport).fetchAllPages(TenPerPage.self, path: "/things/")
         }
         #expect(log.requestedPages == [1])
     }
 
-    /// `total` is decoded straight from JSON, so `total + pageSize - 1` on `Int.max` used
-    /// to trap the process. It must surface as an error instead.
+    /// `total` is decoded straight from JSON, so an enormous value that would amplify
+    /// into more than `maxParallelPages` must surface as an error instead of trapping
+    /// or flooding the network.
     @Test
     func `a total large enough to overflow the page arithmetic surfaces as an error`() async throws {
-        let json = #"{"things":[{"id":1},{"id":2}],"next_page":null,"total":9223372036854775807}"#
-        await #expect(throws: TestErrors.Failure.decode) {
+        let json = #"{"things":[{"id":1},{"id":2}],"next_page":"?page=2","total":9223372036854775807}"#
+        await #expect(throws: TestErrors.Failure.invalidRequest) {
             _ = try await makeClient(transport: FixedFirstPageTransport(json: json))
                 .fetchAllPages(TenPerPage.self, path: "/things/")
         }
@@ -1220,6 +1242,15 @@ struct PageCountTests {
         let items = try await makeClient(transport: FixedFirstPageTransport(json: json))
             .fetchAllPages(HugePageSize.self, path: "/things/")
 
+        #expect(items == [Thing(id: 1)])
+    }
+
+    /// A total above the old fixed ceiling is fine when `pageSize` collapses it to one page.
+    @Test
+    func `a large total that fits on one page is accepted`() async throws {
+        let json = #"{"things":[{"id":1}],"next_page":null,"total":100000001}"#
+        let items = try await makeClient(transport: FixedFirstPageTransport(json: json))
+            .fetchAllPages(HugePageSize.self, path: "/things/")
         #expect(items == [Thing(id: 1)])
     }
 }
@@ -1259,5 +1290,459 @@ struct PathSelectionTests {
         #expect(items == things(1 ... 25))
         #expect(log.requestedPages.count == 3)
         #expect(log.mainThreadRequestCount == 0)
+    }
+}
+
+// MARK: - Open-issue regressions
+
+/// Mixed nil / non-nil identities: any nil routes the list to sequential traversal,
+/// where the nil opt-out contract says de-duplication must not drop repeats.
+private nonisolated struct MixedIdentityPage: PagedResponse {
+    let things: [Thing]
+    let nextPage: String?
+    let total: Int?
+    var pageItems: [Thing] { things }
+
+    nonisolated static var pageSize: Int { 10 }
+
+    nonisolated static func identity(of item: Thing) -> AnyHashable? {
+        item.id < 0 ? nil : item.id
+    }
+
+    enum CodingKeys: String, CodingKey { case things; case nextPage = "next_page"; case total }
+}
+
+private nonisolated struct ZeroPageSize: PagedResponse {
+    let things: [Thing]
+    let nextPage: String?
+    let total: Int?
+    var pageItems: [Thing] { things }
+    nonisolated static var pageSize: Int { 0 }
+    nonisolated static func identity(of item: Thing) -> AnyHashable? { item.id }
+    enum CodingKeys: String, CodingKey { case things; case nextPage = "next_page"; case total }
+}
+
+/// Serves sequential pages from a fixed chain of JSON bodies, keyed by request order.
+private nonisolated struct SequentialJSONTransport: RESTTransport {
+    let pages: [String]
+    let captured: CapturedRequests
+
+    func data(for request: RESTRequest) async throws -> (Data, Int) {
+        let index = captured.append(request) - 1
+        let json = pages[min(index, pages.count - 1)]
+        return (Data(json.utf8), 200)
+    }
+}
+
+private nonisolated struct CapturingFixedTransport: RESTTransport {
+    let inner: FixedResponseTransport
+    let captured: CapturedRequests
+
+    func data(for request: RESTRequest) async throws -> (Data, Int) {
+        _ = captured.append(request)
+        return try await inner.data(for: request)
+    }
+}
+
+/// Parallel-aware stub: page 1 is fixed JSON; later `page` query values are served from `later`.
+private nonisolated struct FirstThenNumberedTransport: RESTTransport {
+    let first: String
+    let later: [Int: String]
+    let captured: CapturedRequests
+
+    func data(for request: RESTRequest) async throws -> (Data, Int) {
+        _ = captured.append(request)
+        let page = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?
+            .queryItems?.first { $0.name.compare("page", options: .caseInsensitive) == .orderedSame }?
+            .value.flatMap(Int.init) ?? 1
+        let json = page <= 1 ? first : (later[page] ?? #"{"things":[],"next_page":null,"total":0}"#)
+        return (Data(json.utf8), 200)
+    }
+}
+
+@Suite("Pagination open-issue regressions")
+struct PaginationIssueRegressionTests {
+    @Test
+    func `configured base URL fragments do not appear on request URLs`() async throws {
+        let captured = CapturedRequests()
+        let base = try #require(URL(string: "https://example.test/api/#section"))
+        let client = makeClient(
+            transport: QueryCaptureTransport(captured: captured),
+            baseURL: base
+        )
+
+        // Capture via a transport that returns a single-object JSON body.
+        let fixed = FixedResponseTransport(data: Data(#"{"id":1}"#.utf8), status: 200)
+        let wrapping = CapturingFixedTransport(inner: fixed, captured: captured)
+        let client2 = makeClient(transport: wrapping, baseURL: base)
+        _ = try await client2.fetch(Thing.self, path: "things/1")
+        let url = try #require(captured.values.first?.url)
+        #expect(url.fragment == nil)
+        #expect(url.absoluteString.contains("#") == false)
+        _ = client
+    }
+
+    @Test
+    func `a nil next page on the first response stops parallel speculation`() async throws {
+        let log = RequestLog()
+        let transport = ScriptedTransport(
+            pages: [Array(1 ... 10), Array(11 ... 20)],
+            total: 20,
+            outOfRange: .notFound,
+            log: log
+        )
+        // Override page 1 to omit next_page while still advertising a multi-page total.
+        let captured = CapturedRequests()
+        let first = """
+        {"things":[{"id":1},{"id":2},{"id":3},{"id":4},{"id":5},\
+        {"id":6},{"id":7},{"id":8},{"id":9},{"id":10}],"next_page":null,"total":20}
+        """
+        let client = makeClient(
+            transport: FirstThenNumberedTransport(first: first, later: [
+                2: #"{"things":[{"id":11}],"next_page":null,"total":20}"#
+            ], captured: captured)
+        )
+
+        let items = try await client.fetchAllPages(TenPerPage.self, path: "/things/")
+        #expect(items == things(1 ... 10))
+        #expect(captured.values.count == 1)
+        _ = log // keep the ScriptedTransport type referenced for clarity in sibling tests
+    }
+
+    @Test
+    func `an intentional initial page query is replaced on the first pagination request`() async throws {
+        let captured = CapturedRequests()
+        let base = try #require(URL(string: "https://example.test/things?page=5"))
+        let seq = SequentialJSONTransport(
+            pages: [#"{"things":[{"id":50}],"next_page":null,"total":null}"#],
+            captured: captured
+        )
+        let items = try await makeClient(transport: seq, baseURL: base)
+            .fetchAllPages(Unidentified.self, path: "")
+        #expect(items == [Thing(id: 50)])
+        let page = URLComponents(url: try #require(captured.values.first?.url), resolvingAgainstBaseURL: false)?
+            .queryItems?.first { $0.name == "page" }?.value
+        // Parallel/sequential page construction owns `page`; a stale base query must not stick.
+        #expect(page == nil)
+    }
+
+    @Test
+    func `an empty first page with a positive total still fetches later pages`() async throws {
+        let captured = CapturedRequests()
+        let first = #"{"things":[],"next_page":null,"total":20}"#
+        let page2 = """
+        {"things":[{"id":11},{"id":12},{"id":13},{"id":14},{"id":15},\
+        {"id":16},{"id":17},{"id":18},{"id":19},{"id":20}],"next_page":null,"total":20}
+        """
+        let client = makeClient(
+            transport: FirstThenNumberedTransport(first: first, later: [2: page2], captured: captured)
+        )
+
+        let items = try await client.fetchAllPages(TenPerPage.self, path: "/things/")
+        #expect(items == things(11 ... 20))
+        let pages = captured.values.compactMap { request -> Int? in
+            URLComponents(url: request.url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first { $0.name == "page" }?.value.flatMap(Int.init)
+        }
+        #expect(Set(pages).isSuperset(of: [2]))
+        #expect(captured.values.count == 2)
+    }
+
+    @Test
+    func `a negative total fails on the sequential path before any snapshot`() async throws {
+        let json = #"{"things":[],"next_page":"?page=2","total":-1}"#
+        var snapshots: [[Thing]] = []
+        await #expect(throws: TestErrors.Failure.decode) {
+            for try await snapshot in makeClient(transport: FixedFirstPageTransport(json: json))
+                .streamAllPages(Unidentified.self, path: "/things/") {
+                snapshots.append(snapshot)
+            }
+        }
+        #expect(snapshots.isEmpty)
+    }
+
+    @Test
+    func `invalid page size fails before the first snapshot`() async throws {
+        let json = #"{"things":[],"next_page":null,"total":20}"#
+        var snapshots: [[Thing]] = []
+        await #expect(throws: TestErrors.Failure.decode) {
+            for try await snapshot in makeClient(transport: FixedFirstPageTransport(json: json))
+                .streamAllPages(ZeroPageSize.self, path: "/things/") {
+                snapshots.append(snapshot)
+            }
+        }
+        #expect(snapshots.isEmpty)
+    }
+
+    @Test
+    func `a backward final page link with new rows fails instead of completing`() async throws {
+        let captured = CapturedRequests()
+        // total implies 2 pages; page 2 returns a new row but points backward to page 1.
+        let first = #"{"things":[{"id":1},{"id":2}],"next_page":"?page=2","total":3}"#
+        let page2 = #"{"things":[{"id":3}],"next_page":"?page=1","total":3}"#
+        let client = makeClient(
+            transport: FirstThenNumberedTransport(first: first, later: [2: page2], captured: captured)
+        )
+
+        await #expect(throws: TestErrors.Failure.invalidRequest) {
+            _ = try await client.fetchAllPages(ThingsPage.self, path: "/things/")
+        }
+    }
+
+    @Test
+    func `a negative final page link fails instead of truncating`() async throws {
+        let captured = CapturedRequests()
+        let first = #"{"things":[{"id":1},{"id":2}],"next_page":"?page=2","total":3}"#
+        let page2 = #"{"things":[{"id":3}],"next_page":"?page=-1","total":3}"#
+        let client = makeClient(
+            transport: FirstThenNumberedTransport(first: first, later: [2: page2], captured: captured)
+        )
+
+        await #expect(throws: TestErrors.Failure.invalidRequest) {
+            _ = try await client.fetchAllPages(ThingsPage.self, path: "/things/")
+        }
+    }
+
+    @Test
+    func `an overflowing numeric final page link fails instead of being followed`() async throws {
+        let captured = CapturedRequests()
+        let first = #"{"things":[{"id":1},{"id":2}],"next_page":"?page=2","total":3}"#
+        let huge = String(repeating: "9", count: 40)
+        let page2 = #"{"things":[{"id":3}],"next_page":"?page=\#(huge)","total":3}"#
+        let client = makeClient(
+            transport: FirstThenNumberedTransport(first: first, later: [2: page2], captured: captured)
+        )
+
+        await #expect(throws: TestErrors.Failure.invalidRequest) {
+            _ = try await client.fetchAllPages(ThingsPage.self, path: "/things/")
+        }
+        #expect(captured.values.count == 2)
+    }
+
+    @Test
+    func `sequential page limit counts the first page`() async throws {
+        let captured = CapturedRequests()
+        let pages = (1 ... 3).map { n -> String in
+            let next = n < 3 ? #""?page=\#(n + 1)""# : "null"
+            return #"{"things":[{"id":\#(n)}],"next_page":\#(next),"total":null}"#
+        }
+        let client = makeClient(
+            transport: SequentialJSONTransport(pages: pages, captured: captured),
+            maxSequentialPages: 2
+        )
+
+        await #expect(throws: TestErrors.Failure.invalidRequest) {
+            _ = try await client.fetchAllPages(Unidentified.self, path: "/things/")
+        }
+        #expect(captured.values.count == 2)
+    }
+
+    @Test
+    func `sequential page limit allows exactly the configured number of pages`() async throws {
+        let captured = CapturedRequests()
+        let pages = (1 ... 2).map { n -> String in
+            let next = n < 2 ? #""?page=\#(n + 1)""# : "null"
+            return #"{"things":[{"id":\#(n)}],"next_page":\#(next),"total":null}"#
+        }
+        let client = makeClient(
+            transport: SequentialJSONTransport(pages: pages, captured: captured),
+            maxSequentialPages: 2
+        )
+
+        let items = try await client.fetchAllPages(Unidentified.self, path: "/things/")
+        #expect(items == [Thing(id: 1), Thing(id: 2)])
+        #expect(captured.values.count == 2)
+    }
+
+    @Test
+    func `nil identity sequential path keeps repeated identities`() async throws {
+        let captured = CapturedRequests()
+        // id -1 has nil identity → whole list is sequential; id 7 repeats and must be kept.
+        let pages = [
+            #"{"things":[{"id":-1},{"id":7}],"next_page":"?page=2","total":null}"#,
+            #"{"things":[{"id":7},{"id":8}],"next_page":null,"total":null}"#
+        ]
+        let client = makeClient(
+            transport: SequentialJSONTransport(pages: pages, captured: captured)
+        )
+
+        let items = try await client.fetchAllPages(MixedIdentityPage.self, path: "/things/")
+        #expect(items.map(\.id) == [-1, 7, 7, 8])
+    }
+
+    @Test
+    func `relative next page links resolve against the current page URL`() async throws {
+        let captured = CapturedRequests()
+        let base = try #require(URL(string: "https://example.test/api/"))
+        let pages = [
+            #"{"things":[{"id":1}],"next_page":"?page=2","total":null}"#,
+            #"{"things":[{"id":2}],"next_page":"next?page=3","total":null}"#,
+            #"{"things":[{"id":3}],"next_page":null,"total":null}"#
+        ]
+        let client = makeClient(
+            transport: SequentialJSONTransport(pages: pages, captured: captured),
+            baseURL: base
+        )
+
+        let items = try await client.fetchAllPages(Unidentified.self, path: "things")
+        #expect(items == things(1 ... 3))
+        #expect(captured.values.map(\.url.path) == [
+            "/api/things",
+            "/api/things",
+            "/api/next"
+        ])
+        let secondPage = URLComponents(url: captured.values[1].url, resolvingAgainstBaseURL: false)?
+            .queryItems?.first { $0.name == "page" }?.value
+        #expect(secondPage == "2")
+    }
+
+    @Test
+    func `parallel page limit is configurable`() async throws {
+        let log = RequestLog()
+        let transport = ScriptedTransport(
+            pages: [Array(1 ... 10), Array(11 ... 20)],
+            total: 50,
+            outOfRange: .notFound,
+            log: log
+        )
+        await #expect(throws: TestErrors.Failure.invalidRequest) {
+            _ = try await makeClient(transport: transport, maxParallelPages: 2)
+                .fetchAllPages(TenPerPage.self, path: "/things/")
+        }
+        #expect(log.requestedPages == [1])
+    }
+}
+
+private nonisolated struct CancellationProbeTransport: RESTTransport {
+    func data(for _: RESTRequest) async throws -> (Data, Int) {
+        throw CancellationError()
+    }
+}
+
+private struct BroadlyTransientErrors: RESTTransportErrorMapping {
+    enum Failure: Error { case other }
+    nonisolated func missingAPIKey() -> any Error { Failure.other }
+    nonisolated func http(status _: Int, body _: String) -> any Error { Failure.other }
+    nonisolated func decode(_: String) -> any Error { Failure.other }
+    nonisolated func network(_: URLError) -> any Error { Failure.other }
+    nonisolated func isTransient(_: any Error) -> Bool { true }
+}
+
+@Suite("Client open-issue regressions")
+struct ClientIssueRegressionTests {
+    @Test
+    func `error body truncation does not split a multibyte UTF-8 scalar`() {
+        // Cap after the lead byte of "é" (C3 A9) so a naive byte prefix would be invalid.
+        let prefix = Data(repeating: 0x41, count: PaginatedRESTClient.maxMappedErrorBodyBytes - 1)
+        let body = prefix + Data([0xC3, 0xA9, 0x42])
+        let text = PaginatedRESTClient.boundedErrorBody(body)
+        #expect(text.contains("�") == false)
+        #expect(text.hasSuffix(" [truncated]"))
+        #expect(PaginatedRESTClient.utf8PrefixEndIndex(Data([0x41, 0xC3, 0xA9]), maxBytes: 2) == 1)
+        // Full "é" still fits when maxBytes lands on its final byte.
+        #expect(PaginatedRESTClient.utf8PrefixEndIndex(Data([0x41, 0xC3, 0xA9, 0x42]), maxBytes: 3) == 3)
+    }
+
+    @Test
+    func `root coding path is reported as dollar`() async throws {
+        let error = await #expect(throws: DetailedFailure.self) {
+            _ = try await PaginatedRESTClient(
+                apiKey: "key",
+                baseURL: URL(string: "https://example.test")!,
+                transport: FixedResponseTransport(data: Data("[]".utf8), status: 200),
+                decoderFactory: { JSONDecoder() },
+                encoderFactory: { JSONEncoder() },
+                errors: DetailedErrors()
+            ).fetch(Thing.self, path: "/things/1")
+        }
+        guard case let .decode(detail) = error else {
+            Issue.record("Expected decode failure")
+            return
+        }
+        #expect(detail.contains("at $"))
+    }
+
+    @Test
+    func `send rejects GET with a JSON body`() async throws {
+        await #expect(throws: TestErrors.Failure.invalidRequest) {
+            try await makeClient().send(
+                method: "GET",
+                path: "/things/",
+                body: ["id": 1]
+            )
+        }
+    }
+
+    @Test
+    func `cancellationError from a transport is not classified as transient`() async throws {
+        let client = PaginatedRESTClient(
+            apiKey: "key",
+            baseURL: URL(string: "https://example.test")!,
+            transport: CancellationProbeTransport(),
+            decoderFactory: { JSONDecoder() },
+            encoderFactory: { JSONEncoder() },
+            errors: BroadlyTransientErrors()
+        )
+        let request = try client.authorizedGET(#require(URL(string: "https://example.test/things/1")))
+        await #expect(throws: CancellationError.self) {
+            _ = try await client.performWithRetry(Thing.self, request: request, maxAttempts: 3)
+        }
+    }
+
+    @Test
+    func `retry logs omit URL path segments`() async throws {
+        final nonisolated class LogSink: @unchecked Sendable {
+            private let lock = NSLock()
+            private var messages: [String] = []
+            nonisolated func append(_ message: String) { lock.withLock { messages.append(message) } }
+            nonisolated func snapshot() -> [String] { lock.withLock { messages } }
+        }
+        let sink = LogSink()
+        let transport = RetryOnceTransport(retryAfter: nil, status: 500)
+        let client = PaginatedRESTClient(
+            apiKey: "key",
+            baseURL: URL(string: "https://example.test")!,
+            transport: transport,
+            decoderFactory: { JSONDecoder() },
+            encoderFactory: { JSONEncoder() },
+            errors: TestErrors(),
+            log: { sink.append($0) },
+            retryRuntime: .live
+        )
+        let request = try client.authorizedGET(
+            #require(URL(string: "https://example.test/accounts/secret-token/things/1"))
+        )
+        _ = try await client.performWithRetry(Thing.self, request: request, maxAttempts: 2)
+        // Allow the utility Task that emits logs to run.
+        for _ in 0 ..< 50 {
+            if !sink.snapshot().isEmpty { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let logged = sink.snapshot()
+        #expect(!logged.isEmpty)
+        for message in logged {
+            #expect(message.contains("secret-token") == false)
+            #expect(message.contains("/accounts/") == false)
+        }
+    }
+
+    @Test
+    func `file-backed idempotent requests are not auto-retried`() async throws {
+        let bodyFileURL = FileManager.default.temporaryDirectory
+            .appending(path: "PaginatedRESTClient-\(UUID().uuidString).body")
+        try Data("{}".utf8).write(to: bodyFileURL)
+        defer { try? FileManager.default.removeItem(at: bodyFileURL) }
+
+        let transport = CountingStatusTransport(status: 500)
+        let client = makeClient(transport: transport)
+        let request = RESTRequest(
+            url: try #require(URL(string: "https://example.test/upload")),
+            method: "PUT",
+            bodyFileURL: bodyFileURL
+        )
+        await #expect(throws: TestErrors.Failure.http(500)) {
+            _ = try await client.performWithRetry(Thing.self, request: request, maxAttempts: 3)
+        }
+        #expect(transport.requestCount == 1)
     }
 }

@@ -22,7 +22,9 @@ public struct URLSessionTransport: RESTTransport {
     nonisolated let successResponseLimit: Int
     nonisolated let errorResponseLimit: Int
 
-    public init(
+    // `nonisolated` so network actors and background containers can construct the
+    // default transport without hopping to MainActor.
+    public nonisolated init(
         session: URLSession = .shared,
         successResponseLimit: Int = 10 * 1024 * 1024,
         errorResponseLimit: Int = 64 * 1024
@@ -65,8 +67,15 @@ public struct URLSessionTransport: RESTTransport {
             throw URLError(.badServerResponse)
         }
         let limit = (200 ..< 300).contains(http.statusCode) ? successResponseLimit : errorResponseLimit
-        guard http.expectedContentLength < 0 || http.expectedContentLength <= Int64(limit) else {
-            throw RESTResponseTooLargeError(statusCode: http.statusCode, limit: limit)
+        let declared = http.expectedContentLength >= 0 ? http.expectedContentLength : nil
+        guard declared.map({ $0 <= Int64(limit) }) ?? true else {
+            throw RESTResponseTooLargeError(
+                statusCode: http.statusCode,
+                limit: limit,
+                phase: .headers,
+                declaredContentLength: declared,
+                observedByteCount: 0
+            )
         }
 
         var data = Data()
@@ -75,7 +84,13 @@ public struct URLSessionTransport: RESTTransport {
         }
         for try await byte in bytes {
             guard data.count < limit else {
-                throw RESTResponseTooLargeError(statusCode: http.statusCode, limit: limit)
+                throw RESTResponseTooLargeError(
+                    statusCode: http.statusCode,
+                    limit: limit,
+                    phase: .body,
+                    declaredContentLength: declared,
+                    observedByteCount: data.count
+                )
             }
             data.append(byte)
         }
@@ -98,35 +113,94 @@ public struct URLSessionTransport: RESTTransport {
             urlRequest.setValue(value, forHTTPHeaderField: field)
         }
         if let bodyFileURL = request.bodyFileURL {
-            guard bodyFileURL.isFileURL else {
-                throw RESTRequestBodyError.bodyFileMustBeFileURL(bodyFileURL)
-            }
-            guard FileManager.default.isReadableFile(atPath: bodyFileURL.path),
-                  let stream = InputStream(url: bodyFileURL)
-            else {
-                throw RESTRequestBodyError.unreadableBodyFile(bodyFileURL)
-            }
-            urlRequest.httpBodyStream = stream
+            try Self.attachFileBody(bodyFileURL, to: &urlRequest)
         } else {
             urlRequest.httpBody = request.body
         }
         return urlRequest
     }
+
+    /// Opens the body file for size validation, then attaches a fresh unopened stream.
+    /// URLSession opens and may replay `httpBodyStream` itself; a pre-opened stream is unsafe.
+    private nonisolated static func attachFileBody(
+        _ bodyFileURL: URL,
+        to urlRequest: inout URLRequest
+    ) throws {
+        guard bodyFileURL.isFileURL else {
+            throw RESTRequestBodyError.bodyFileMustBeFileURL(bodyFileURL)
+        }
+        // Open a short-lived handle to prove the path is readable and to read size from the
+        // same open, then close it before handing URLSession an unopened stream.
+        guard let probe = InputStream(url: bodyFileURL) else {
+            throw RESTRequestBodyError.unreadableBodyFile(bodyFileURL)
+        }
+        probe.open()
+        let probeFailed = probe.streamStatus == .error
+        probe.close()
+        guard !probeFailed else {
+            throw RESTRequestBodyError.unreadableBodyFile(bodyFileURL)
+        }
+        let attributes: [FileAttributeKey: Any]
+        do {
+            attributes = try FileManager.default.attributesOfItem(atPath: bodyFileURL.path)
+        } catch {
+            throw RESTRequestBodyError.unreadableBodyFile(bodyFileURL)
+        }
+        guard let sizeNumber = attributes[.size] as? NSNumber else {
+            throw RESTRequestBodyError.unreadableBodyFile(bodyFileURL)
+        }
+        let fileSize = sizeNumber.intValue
+        if let declared = urlRequest.value(forHTTPHeaderField: "Content-Length") {
+            guard declared == String(fileSize) else {
+                throw RESTRequestBodyError.contentLengthMismatch(expected: fileSize, declared: declared)
+            }
+        } else {
+            urlRequest.setValue(String(fileSize), forHTTPHeaderField: "Content-Length")
+        }
+        guard let stream = InputStream(url: bodyFileURL) else {
+            throw RESTRequestBodyError.unreadableBodyFile(bodyFileURL)
+        }
+        urlRequest.httpBodyStream = stream
+    }
+}
+
+/// When a response overflow was detected relative to the configured byte ceiling.
+public nonisolated enum RESTResponseOverflowPhase: String, Sendable, Equatable {
+    /// `Content-Length` (or equivalent) declared a body larger than the limit.
+    case headers
+    /// Streaming body bytes crossed the limit after headers were accepted.
+    case body
 }
 
 /// A response exceeded the configured byte ceiling while headers or body bytes were
 /// arriving. Direct ``RESTTransport`` consumers can use these facts to map the failure
-/// into their own domain error; ``PaginatedRESTClient`` maps it through
-/// ``RESTTransportErrorMapping/decode(_:)`` automatically.
+/// into their own domain error; ``PaginatedRESTClient`` maps success-status overflows
+/// through ``RESTTransportErrorMapping/decode(_:)`` and non-success overflows through
+/// ``RESTTransportErrorMapping/http(status:body:)``.
 public nonisolated struct RESTResponseTooLargeError: Error, Equatable, Sendable {
     /// HTTP status from the response whose body exceeded its applicable limit.
     public let statusCode: Int
     /// The configured maximum number of response-body bytes.
     public let limit: Int
+    /// Whether the overflow was detected from declared length or while streaming.
+    public let phase: RESTResponseOverflowPhase
+    /// Server-declared body length when known (`Content-Length`); `nil` if chunked/unknown.
+    public let declaredContentLength: Int64?
+    /// Bytes observed before rejection (0 for a headers-phase rejection).
+    public let observedByteCount: Int
 
-    public init(statusCode: Int, limit: Int) {
+    public nonisolated init(
+        statusCode: Int,
+        limit: Int,
+        phase: RESTResponseOverflowPhase,
+        declaredContentLength: Int64? = nil,
+        observedByteCount: Int = 0
+    ) {
         self.statusCode = statusCode
         self.limit = limit
+        self.phase = phase
+        self.declaredContentLength = declaredContentLength
+        self.observedByteCount = observedByteCount
     }
 }
 
@@ -218,9 +292,16 @@ final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecke
             return
         }
         let limit = (200 ..< 300).contains(http.statusCode) ? successResponseLimit : errorResponseLimit
-        guard http.expectedContentLength < 0 || http.expectedContentLength <= Int64(limit) else {
+        let declared = http.expectedContentLength >= 0 ? http.expectedContentLength : nil
+        guard declared.map({ $0 <= Int64(limit) }) ?? true else {
             completionHandler(.cancel)
-            complete(.failure(RESTResponseTooLargeError(statusCode: http.statusCode, limit: limit)))
+            complete(.failure(RESTResponseTooLargeError(
+                statusCode: http.statusCode,
+                limit: limit,
+                phase: .headers,
+                declaredContentLength: declared,
+                observedByteCount: 0
+            )))
             return
         }
 
@@ -245,7 +326,14 @@ final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecke
         let receipt = lock.withLock { () -> DataReceipt in
             guard !state.completed, let response = state.response else { return .ignored }
             guard data.count <= state.limit - state.data.count else {
-                return .overflow(RESTResponseTooLargeError(statusCode: response.statusCode, limit: state.limit))
+                let declared = response.expectedContentLength >= 0 ? response.expectedContentLength : nil
+                return .overflow(RESTResponseTooLargeError(
+                    statusCode: response.statusCode,
+                    limit: state.limit,
+                    phase: .body,
+                    declaredContentLength: declared,
+                    observedByteCount: state.data.count
+                ))
             }
             state.data.append(data)
             return .accepted
@@ -318,6 +406,10 @@ final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecke
 }
 
 extension BoundedURLSessionLoader {
+    // Intentionally do not forward `urlSession(_:didBecomeInvalidWithError:)`.
+    // This loader owns a per-request session; telling the caller's delegate that *their*
+    // session was invalidated would tear down shared networking after one request.
+
     func urlSession(
         _ session: URLSession,
         didReceive challenge: URLAuthenticationChallenge,

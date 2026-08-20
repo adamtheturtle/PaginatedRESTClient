@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
 
 concurrency:
@@ -14,33 +15,72 @@ jobs:
     name: SwiftLint
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v7
-      - name: Install SwiftLint
-        run: brew install swiftlint
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+      - name: Install pinned SwiftLint
+        env:
+          SWIFTLINT_VERSION: "0.65.0"
+          SWIFTLINT_SHA256: "d6cb0aa7a2f5f1ef306fc9e37bcb54dc9a26facc8f7784ac0c3dd3eccf5c6ba6"
+        run: |
+          curl -fsSL \
+            "https://github.com/realm/SwiftLint/releases/download/${SWIFTLINT_VERSION}/portable_swiftlint.zip" \
+            -o /tmp/portable_swiftlint.zip
+          echo "${SWIFTLINT_SHA256}  /tmp/portable_swiftlint.zip" | shasum -a 256 -c -
+          mkdir -p "$HOME/.local/bin"
+          unzip -o /tmp/portable_swiftlint.zip -d /tmp/swiftlint
+          install /tmp/swiftlint/swiftlint "$HOME/.local/bin/swiftlint"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/swiftlint" version | grep -F "$SWIFTLINT_VERSION"
       - name: Lint
         run: swiftlint lint --strict
 
   macos:
-    name: macOS (Swift ${{ matrix.swift }})
+    name: macOS (Xcode ${{ matrix.xcode }})
     runs-on: macos-26
     strategy:
       fail-fast: false
       matrix:
-        # The package requires swift-tools-version 6.2 (defaultIsolation, raw
-        # identifiers, NonisolatedNonsendingByDefault). latest-stable Xcode on the
-        # macos-26 image provides Swift 6.2+.
-        swift: ["latest-stable"]
+        # The package requires swift-tools-version 6.2. Pin the oldest Xcode on
+        # macos-26 that still provides that toolchain, plus latest-stable.
+        xcode: ["26.0.1", "latest-stable"]
     steps:
-      - uses: actions/checkout@v7
-      - uses: maxim-lobanov/setup-xcode@v1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
         with:
-          xcode-version: ${{ matrix.swift }}
+          xcode-version: ${{ matrix.xcode }}
       - name: Swift version
         run: swift --version
       - name: Build
         run: swift build --build-tests
       - name: Test
         run: swift test
+      - name: Release build
+        run: swift build -c release
+
+  apple-platforms:
+    name: Apple platforms
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
+        with:
+          xcode-version: latest-stable
+      - name: Resolve package
+        run: swift package resolve
+      - name: Build declared Apple platforms
+        run: |
+          set -euo pipefail
+          for destination in \
+            "generic/platform=iOS" \
+            "generic/platform=tvOS" \
+            "generic/platform=watchOS" \
+            "generic/platform=visionOS"
+          do
+            echo "Building for $destination"
+            xcodebuild -scheme PaginatedRESTClient \
+              -destination "$destination" \
+              -derivedDataPath .build/DerivedData \
+              build
+          done
 
   linux:
     name: Linux (Swift ${{ matrix.swift }})
@@ -48,28 +88,69 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The core is Foundation-only and must stay Linux-clean.
-        swift: ["6.2"]
-    container: swift:${{ matrix.swift }}
+        # The core is Foundation-only and must stay Linux-clean. Pin the container
+        # by digest so the tag cannot silently move (issue #210).
+        include:
+          - swift: "6.2"
+            image: swift@sha256:5660a92e47b0ab41a432952c08914998c5efa22eed74bb5025c3ddd9dd7ed9de
+    container: ${{ matrix.image }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
       - name: Swift version
         run: swift --version
       - name: Build
         run: swift build --build-tests
       - name: Test
         run: swift test
+      - name: Release build
+        run: swift build -c release
+
+  docs:
+    name: DocC
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
+        with:
+          xcode-version: latest-stable
+      - name: Build documentation catalog
+        run: |
+          swift package --allow-writing-to-directory .build/docs generate-documentation \
+            --target PaginatedRESTClient \
+            --disable-indexing \
+            --transform-for-static-hosting \
+            --output-path .build/docs
+
+  api-diff:
+    name: API compatibility
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+        with:
+          fetch-depth: 0
+      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
+        with:
+          xcode-version: latest-stable
+      - name: Diagnose API breaking changes
+        run: |
+          baseline="$(git describe --tags --abbrev=0)"
+          echo "Baseline $baseline"
+          if [[ -f .api-breakage-allowlist.txt ]]; then
+            swift package diagnose-api-breaking-changes "$baseline" \
+              --targets PaginatedRESTClient \
+              --breakage-allowlist-path .api-breakage-allowlist.txt
+          else
+            swift package diagnose-api-breaking-changes "$baseline" \
+              --targets PaginatedRESTClient
+          fi
 
   prose:
     name: Vale
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10.0.1
-      # ai-tells bans em dashes and other AI-written prose patterns.  The style package is pinned in
-      # ``.vale.ini`` and ``vale sync`` downloads it into the gitignored
-      # ``styles`` directory.
-      - name: Sync Vale styles
-        run: uvx vale@3.13.0.0 sync
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      # Styles are vendored under ``vale/styles`` (issue #211); no ``vale sync`` download.
+      # Null-delimited paths keep Markdown filenames with whitespace lintable (issue #161).
       - name: Lint prose
-        run: git ls-files '*.md' | xargs --no-run-if-empty uvx vale@3.13.0.0
+        run: git ls-files -z -- '*.md' | xargs -0 --no-run-if-empty uvx vale@3.13.0.0
