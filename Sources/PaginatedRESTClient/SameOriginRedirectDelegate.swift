@@ -20,7 +20,6 @@ final nonisolated class SameOriginRedirectDelegate: NSObject, URLSessionTaskDele
 
     private let requestOrigin: Origin?
     private let bodyFileURL: URL?
-    private let bodyStreamFailureBox: FileBodyStreamFailureBox?
     private let requiresSameOrigin: Bool
     private let sessionDelegate: (any URLSessionDelegate)?
     private let forwardingDelegate: (any URLSessionTaskDelegate)?
@@ -28,13 +27,11 @@ final nonisolated class SameOriginRedirectDelegate: NSObject, URLSessionTaskDele
     init(
         requestURL: URL?,
         bodyFileURL: URL? = nil,
-        bodyStreamFailureBox: FileBodyStreamFailureBox? = nil,
         requiresSameOrigin: Bool = true,
         forwardingDelegate: (any URLSessionDelegate)?
     ) {
         requestOrigin = Self.origin(from: requestURL)
         self.bodyFileURL = bodyFileURL
-        self.bodyStreamFailureBox = bodyStreamFailureBox
         self.requiresSameOrigin = requiresSameOrigin
         sessionDelegate = forwardingDelegate
         self.forwardingDelegate = forwardingDelegate as? any URLSessionTaskDelegate
@@ -143,12 +140,7 @@ final nonisolated class SameOriginRedirectDelegate: NSObject, URLSessionTaskDele
         needNewBodyStream completionHandler: @escaping @Sendable (InputStream?) -> Void
     ) {
         if let bodyFileURL {
-            if let stream = InputStream(url: bodyFileURL) {
-                completionHandler(stream)
-            } else {
-                bodyStreamFailureBox?.markFailed()
-                completionHandler(nil)
-            }
+            completionHandler(InputStream(url: bodyFileURL))
             return
         }
         guard let forwardingDelegate else {
