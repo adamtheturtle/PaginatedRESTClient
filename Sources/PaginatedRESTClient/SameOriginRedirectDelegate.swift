@@ -243,10 +243,53 @@ final nonisolated class SameOriginRedirectDelegate: NSObject, URLSessionTaskDele
         guard let url,
               let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
               let scheme = components.scheme?.lowercased(),
-              let host = components.host?.lowercased(),
+              let rawHost = components.host?.lowercased(),
               let port = components.port ?? defaultPort(for: scheme)
         else { return nil }
-        return Origin(scheme: scheme, host: host, port: port)
+        return Origin(scheme: scheme, host: canonicalHost(rawHost), port: port)
+    }
+
+    private static func canonicalHost(_ host: String) -> String {
+        let unbracketed = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        guard unbracketed.contains(":"),
+              let canonicalIPv6 = canonicalIPv6Address(unbracketed)
+        else {
+            return host
+        }
+        return canonicalIPv6
+    }
+
+    /// Expands an IPv6 literal into eight hexadecimal groups for comparison. This avoids
+    /// treating equivalent compressed and expanded literals as separate origins.
+    private static func canonicalIPv6Address(_ value: String) -> String? {
+        let halves = value.components(separatedBy: "::")
+        guard halves.count <= 2 else { return nil }
+
+        func groups(in half: String) -> [String]? {
+            guard !half.isEmpty else { return [] }
+            let groups = half.split(separator: ":").map(String.init)
+            guard groups.allSatisfy({
+                (1 ... 4).contains($0.count) && UInt16($0, radix: 16) != nil
+            }) else {
+                return nil
+            }
+            return groups
+        }
+
+        guard let leading = groups(in: halves[0]),
+              let trailing = halves.count == 2 ? groups(in: halves[1]) : [],
+              leading.count + trailing.count <= 8
+        else {
+            return nil
+        }
+        let zeroCount = 8 - leading.count - trailing.count
+        guard (halves.count == 2 && zeroCount >= 1) || (halves.count == 1 && zeroCount == 0) else {
+            return nil
+        }
+        return (leading + Array(repeating: "0", count: zeroCount) + trailing)
+            .compactMap { UInt16($0, radix: 16) }
+            .map { String($0, radix: 16) }
+            .joined(separator: ":")
     }
 
     private static func defaultPort(for scheme: String) -> Int? {

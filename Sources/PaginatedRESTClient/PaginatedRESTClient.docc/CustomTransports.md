@@ -57,18 +57,23 @@ struct GetTransport: RESTTransport {
     }
 
     func response(for request: RESTRequest) async throws -> RESTResponse {
-        var get = Request<Data>(
+        var get = Request<Void>(
             url: request.url,
             method: HTTPMethod(rawValue: request.method)
         )
         get.headers = request.headers
-        // GET pagination is bodyless; pass raw bytes through for mutating requests.
-        if let body = request.body {
-            get.body = body
-        }
 
         do {
-            let response = try await client.data(for: get)
+            let response: Response<Data>
+            if let body = request.body {
+                // `Request.body` is JSON-encoded by Get. Use its upload API so the
+                // already encoded RESTRequest bytes stay unchanged.
+                response = try await client.upload(for: get, from: body)
+            } else if let bodyFileURL = request.bodyFileURL {
+                response = try await client.upload(for: get, fromFile: bodyFileURL)
+            } else {
+                response = try await client.data(for: get)
+            }
             guard let http = response.response as? HTTPURLResponse else {
                 throw URLError(.badServerResponse)
             }
@@ -93,9 +98,9 @@ struct GetTransport: RESTTransport {
 // let client = PaginatedRESTClient(apiKey: token, baseURL: base, transport: transport, …)
 ```
 
-> Get's `Request.body` is `Encodable`. Wrapping it in a `Data`-carrying box (so already
-> encoded bytes pass through untouched) is left to the caller; for plain paginated GETs the
-> body is always `nil` and this never comes up.
+> Get validates non-2xx responses through its `APIClientDelegate` by default. Configure a
+> delegate that permits HTTP responses so this adapter can return their status and body to the
+> paginator's error mapping.
 
 ## Alamofire
 

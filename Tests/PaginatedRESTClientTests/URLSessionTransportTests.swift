@@ -1,4 +1,4 @@
-import PaginatedRESTClient
+@testable import PaginatedRESTClient
 import Foundation
 import Synchronization
 import Testing
@@ -9,6 +9,16 @@ import Testing
 
 @Suite("URLSession transport response limits")
 struct URLSessionTransportTests {
+    @Test
+    func `default transport uses an isolated ephemeral session`() {
+        let transport = URLSessionTransport()
+        #expect(transport.session.configuration.urlCache !== URLSession.shared.configuration.urlCache)
+        #expect(
+            transport.session.configuration.httpCookieStorage
+                !== URLSession.shared.configuration.httpCookieStorage
+        )
+    }
+
     @Test
     func `a file-backed request body is delivered through a stream`() async throws {
         let body = Data(repeating: 0xA5, count: 2 * 1024 * 1024)

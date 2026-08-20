@@ -30,7 +30,7 @@ public nonisolated struct RESTRequest: Sendable {
     public var body: Data?
     /// A local file to stream as the request body without first loading it into
     /// ``body``. The caller must keep the file in place until the request completes.
-    /// Supplying both body sources is rejected by ``URLSessionTransport``.
+    /// Supplying both body sources is rejected before any transport executes the request.
     public var bodyFileURL: URL?
 
     public nonisolated init(
@@ -45,6 +45,13 @@ public nonisolated struct RESTRequest: Sendable {
         self.headers = headers
         self.body = body
         self.bodyFileURL = bodyFileURL
+    }
+
+    /// Validates backend-neutral request invariants before a transport receives the request.
+    public nonisolated func validate() throws {
+        guard body == nil || bodyFileURL == nil else {
+            throw RESTRequestBodyError.multipleSources
+        }
     }
 }
 

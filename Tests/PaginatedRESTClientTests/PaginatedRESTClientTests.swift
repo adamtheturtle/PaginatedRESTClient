@@ -403,6 +403,20 @@ private nonisolated final class ControlledSleeper: @unchecked Sendable {
     }
 }
 
+/// Bounds cooperative test polling so a regression fails instead of hanging the suite.
+private nonisolated func waitUntil(
+    timeout: Duration = .seconds(1),
+    condition: @escaping @Sendable () -> Bool
+) async -> Bool {
+    let clock = ContinuousClock()
+    let deadline = clock.now + timeout
+    while !condition() {
+        guard clock.now < deadline else { return false }
+        await Task.yield()
+    }
+    return true
+}
+
 /// Returns one rate limit response followed by a success, retaining mixed-case headers
 /// to exercise the header-aware transport path and case-insensitive lookup together.
 private nonisolated final class RetryOnceTransport: RESTTransport, @unchecked Sendable {
@@ -544,7 +558,9 @@ private func makeClient(
     baseURL: URL = URL(string: "https://example.test")!,
     retryRuntime: RetryRuntime = .live,
     maxSequentialPages: Int = PaginatedRESTClient.defaultMaxSequentialPages,
-    maxParallelPages: Int = PaginatedRESTClient.defaultMaxParallelPages
+    maxParallelPages: Int = PaginatedRESTClient.defaultMaxParallelPages,
+    maxRetryDelay: TimeInterval = PaginatedRESTClient.defaultMaxRetryDelay,
+    maxAttempts: Int = PaginatedRESTClient.defaultMaxAttempts
 ) -> PaginatedRESTClient {
     PaginatedRESTClient(
         apiKey: "test-key",
@@ -555,7 +571,9 @@ private func makeClient(
         errors: TestErrors(),
         retryRuntime: retryRuntime,
         maxSequentialPages: maxSequentialPages,
-        maxParallelPages: maxParallelPages
+        maxParallelPages: maxParallelPages,
+        maxRetryDelay: maxRetryDelay,
+        maxAttempts: maxAttempts
     )
 }
 
@@ -652,7 +670,7 @@ struct PaginatedRESTClientTests {
             log: log
         )).streamAllPages(TenPerPage.self, path: "/things/")
 
-        while log.requestedPages.count < 100 { await Task.yield() }
+        #expect(await waitUntil { log.requestedPages.count >= 100 })
         try await Task.sleep(for: .milliseconds(50))
         var snapshots: [[Thing]] = []
         for try await snapshot in stream { snapshots.append(snapshot) }
@@ -982,7 +1000,7 @@ struct RateLimitRetryTests {
         let request = try client.authorizedGET(#require(URL(string: "https://example.test/things/1")))
         let task = Task { try await client.performWithRetry(Thing.self, request: request) }
 
-        while sleeper.requestedDelays.isEmpty { await Task.yield() }
+        #expect(await waitUntil { !sleeper.requestedDelays.isEmpty })
         #expect(sleeper.requestedDelays == [7])
         #expect(transport.requestCount == 1)
         clock.advance(by: 7)
@@ -1008,7 +1026,7 @@ struct RateLimitRetryTests {
         let request = try client.authorizedGET(#require(URL(string: "https://example.test/things/1")))
         let task = Task { try await client.performWithRetry(Thing.self, request: request) }
 
-        while sleeper.requestedDelays.isEmpty { await Task.yield() }
+        #expect(await waitUntil { !sleeper.requestedDelays.isEmpty })
         #expect(sleeper.requestedDelays == [1.125])
         clock.advance(by: 1.125)
         sleeper.resumeAll()
@@ -1033,7 +1051,7 @@ struct RateLimitRetryTests {
         let request = try client.authorizedGET(try #require(URL(string: "https://example.test/things/1")))
         let task = Task { try await client.performWithRetry(Thing.self, request: request) }
 
-        while sleeper.requestedDelays.isEmpty { await Task.yield() }
+        #expect(await waitUntil { !sleeper.requestedDelays.isEmpty })
         #expect(sleeper.requestedDelays == [60])
         clock.advance(by: 60)
         sleeper.resumeAll()
@@ -1042,7 +1060,42 @@ struct RateLimitRetryTests {
     }
 
     @Test
-    func `a terminal rate limit does not delay a later request`() async throws {
+    func `client max retry delay honors longer Retry-After values`() async throws {
+        let clock = TestClock()
+        let sleeper = ControlledSleeper()
+        let transport = RetryOnceTransport(retryAfter: "90")
+        let client = makeClient(
+            transport: transport,
+            retryRuntime: RetryRuntime(
+                now: { clock.now },
+                sleep: { try await sleeper.sleep(for: $0) },
+                jitter: { 0 }
+            ),
+            maxRetryDelay: 120
+        )
+        let request = try client.authorizedGET(#require(URL(string: "https://example.test/things/1")))
+        let task = Task { try await client.performWithRetry(Thing.self, request: request) }
+
+        #expect(await waitUntil { !sleeper.requestedDelays.isEmpty })
+        #expect(sleeper.requestedDelays == [90])
+        clock.advance(by: 90)
+        sleeper.resumeAll()
+        #expect(try await task.value == Thing(id: 1))
+    }
+
+    @Test
+    func `client default max attempts applies to fetch retries`() async throws {
+        let transport = CountingStatusTransport(status: 500)
+        let client = makeClient(transport: transport, maxAttempts: 1)
+
+        await #expect(throws: TestErrors.Failure.http(500)) {
+            _ = try await client.fetch(Thing.self, path: "/things/1")
+        }
+        #expect(transport.requestCount == 1)
+    }
+
+    @Test
+    func `a terminal rate limit publishes a cooldown for a later request`() async throws {
         let clock = TestClock()
         let sleeper = ControlledSleeper()
         let transport = TerminalRateLimitTransport()
@@ -1061,14 +1114,12 @@ struct RateLimitRetryTests {
 
         let next = try client.authorizedGET(try #require(URL(string: "https://example.test/next")))
         let task = Task { try await client.performWithRetry(Thing.self, request: next, maxAttempts: 1) }
-        while transport.requestCount(path: "/next") == 0, sleeper.requestedDelays.isEmpty {
-            await Task.yield()
-        }
-        #expect(sleeper.requestedDelays.isEmpty)
-        if !sleeper.requestedDelays.isEmpty {
-            clock.advance(by: 60)
-            sleeper.resumeAll()
-        }
+        #expect(await waitUntil {
+            transport.requestCount(path: "/next") > 0 || !sleeper.requestedDelays.isEmpty
+        })
+        #expect(sleeper.requestedDelays == [60])
+        clock.advance(by: 60)
+        sleeper.resumeAll()
         #expect(try await task.value == Thing(id: 1))
     }
 
@@ -1079,7 +1130,7 @@ struct RateLimitRetryTests {
         let request = try client.authorizedGET(#require(URL(string: "https://example.test/things/1")))
         let task = Task { try await client.performWithRetry(Thing.self, request: request) }
 
-        while transport.requestCount == 0 { await Task.yield() }
+        #expect(await waitUntil { transport.requestCount > 0 })
         task.cancel()
 
         await #expect(throws: CancellationError.self) { try await task.value }
@@ -1101,7 +1152,7 @@ struct RateLimitRetryTests {
         )
         let task = Task { try await client.fetchAllPages(ThingsPage.self, path: "/things/") }
 
-        while sleeper.requestedDelays.count < 2 { await Task.yield() }
+        #expect(await waitUntil { sleeper.requestedDelays.count >= 2 })
         #expect(sleeper.requestedDelays == [10, 10])
         #expect(transport.requestCount(for: 2) == 1)
         #expect(transport.requestCount(for: 3) == 1)
@@ -1630,6 +1681,39 @@ private struct BroadlyTransientErrors: RESTTransportErrorMapping {
 
 @Suite("Client open-issue regressions")
 struct ClientIssueRegressionTests {
+    @Test
+    func `authorized request builds bodyless and file-backed requests safely`() throws {
+        let client = makeClient()
+        let headers = ["Authorization": "Bearer attacker", "X-Request-ID": "abc"]
+        let request = try client.authorizedRequest(method: "DELETE", path: "/things/1", headers: headers)
+        #expect(request.headers["Authorization"] == "Bearer test-key")
+        #expect(request.headers["X-Request-ID"] == "abc")
+        #expect(request.body == nil)
+
+        let bodyFileURL = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        let fileRequest = try client.authorizedRequest(
+            method: "PUT",
+            path: "/upload",
+            bodyFileURL: bodyFileURL
+        )
+        #expect(fileRequest.bodyFileURL == bodyFileURL)
+    }
+
+    @Test
+    func `the client rejects conflicting body sources before a custom transport`() async throws {
+        let transport = CountingStatusTransport(status: 200)
+        let request = RESTRequest(
+            url: try #require(URL(string: "https://example.test/upload")),
+            method: "PUT",
+            body: Data([1]),
+            bodyFileURL: FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        )
+        await #expect(throws: TestErrors.Failure.invalidRequest) {
+            _ = try await makeClient(transport: transport).perform(Thing.self, request: request)
+        }
+        #expect(transport.requestCount == 0)
+    }
+
     @Test
     func `error body truncation does not split a multibyte UTF-8 scalar`() {
         // Cap after the lead byte of "é" (C3 A9) so a naive byte prefix would be invalid.

@@ -14,9 +14,9 @@ import Foundation
 import FoundationNetworking
 #endif
 
-/// A `RESTTransport` backed by `URLSession`. Constructed with `URLSession.shared` by
-/// default; pass a configured session (custom timeouts, an ephemeral configuration, a
-/// stub `URLProtocol`) when you need one.
+/// A `RESTTransport` backed by `URLSession`. By default it owns an ephemeral session, so
+/// cookies and cached responses are not shared with the app's default session. Pass a
+/// configured session (custom timeouts or a stub `URLProtocol`) when you need one.
 public struct URLSessionTransport: RESTTransport {
     nonisolated let session: URLSession
     nonisolated let successResponseLimit: Int
@@ -25,7 +25,7 @@ public struct URLSessionTransport: RESTTransport {
     // `nonisolated` so network actors and background containers can construct the
     // default transport without hopping to MainActor.
     public nonisolated init(
-        session: URLSession = .shared,
+        session: URLSession = URLSession(configuration: .ephemeral),
         successResponseLimit: Int = 10 * 1024 * 1024,
         errorResponseLimit: Int = 64 * 1024
     ) {
@@ -104,9 +104,7 @@ public struct URLSessionTransport: RESTTransport {
 
     /// Translates the backend-neutral `RESTRequest` into a `URLRequest`.
     private nonisolated static func urlRequest(from request: RESTRequest) throws -> URLRequest {
-        guard request.body == nil || request.bodyFileURL == nil else {
-            throw RESTRequestBodyError.multipleSources
-        }
+        try request.validate()
         var urlRequest = URLRequest(url: request.url)
         urlRequest.httpMethod = request.method
         for (field, value) in request.headers {
