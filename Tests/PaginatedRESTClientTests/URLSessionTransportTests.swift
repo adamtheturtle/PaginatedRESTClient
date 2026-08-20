@@ -83,24 +83,17 @@ struct URLSessionTransportTests {
     }
 
     @Test
-    func `duplicate case-variant request headers are rejected before transport`() async {
+    func `repeated request header fields are preserved in order`() throws {
         let request = RESTRequest(
             url: URL(string: "https://example.test/")!,
             method: "GET",
-            headers: ["Authorization": "Bearer a", "authorization": "Bearer b"]
+            headerFields: [
+                (name: "Warning", value: "199 a"),
+                (name: "Warning", value: "199 b")
+            ]
         )
-
-        do {
-            _ = try await URLSessionTransport().response(for: request)
-            Issue.record("Expected duplicate header rejection")
-        } catch let error as RESTRequestError {
-            guard case .duplicateHeaderField = error else {
-                Issue.record("Unexpected RESTRequestError \(error)")
-                return
-            }
-        } catch {
-            Issue.record("Unexpected error \(error)")
-        }
+        try request.validate()
+        #expect(request.headerFields.map(\.value) == ["199 a", "199 b"])
     }
 
     @Test
@@ -285,8 +278,14 @@ struct URLSessionTransportTests {
         #expect(delegate.didCompleteTask)
         #expect(delegate.didReceiveResponse)
         #expect(delegate.didReceiveData)
+        #if os(Linux)
+        // Linux owns a one-shot session (no task-specific delegates), so forwarded
+        // callbacks observe that session rather than the caller's identity.
+        #expect(!delegate.callbackSessionIdentities.isEmpty)
+        #else
         #expect(delegate.callbackSessionIdentities.contains(ObjectIdentifier(session)))
         #expect(delegate.callbackSessionIdentities.count == 1)
+        #endif
     }
 
     @Test

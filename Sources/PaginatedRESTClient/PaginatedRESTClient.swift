@@ -31,6 +31,21 @@ import Foundation
 /// `total` (the count across all pages, when the endpoint reports it) lets the client
 /// compute the page count from the first response and fetch the rest concurrently,
 /// rather than walking `next_page` one blocking round-trip at a time.
+
+/// A ``Hashable`` & ``Sendable`` item identity for pagination de-duplication (#122).
+///
+/// Swift 6 marks `AnyHashable`'s `Sendable` conformance unavailable, so the public
+/// pagination API cannot return `AnyHashable?` for values that cross task boundaries.
+/// This wrapper erases a concrete `Hashable & Sendable` value while remaining usable
+/// in `Set` storage on the parallel page path.
+public nonisolated struct RESTItemIdentity: Hashable, @unchecked Sendable {
+    private let base: AnyHashable
+
+    public nonisolated init<Value: Hashable & Sendable>(_ value: Value) {
+        base = AnyHashable(value)
+    }
+}
+
 public protocol PagedResponse: Decodable, Sendable {
     associatedtype Item: Decodable & Sendable
     // `nonisolated` so the pagination pipeline can read these off the main actor
@@ -55,7 +70,7 @@ public protocol PagedResponse: Decodable, Sendable {
     /// duplicate rows. `nil` opts out (e.g. items with no stable unique id), and
     /// opting out routes the whole list down the sequential `next_page` walk, where
     /// de-duplication isn't needed because no page is ever requested speculatively.
-    nonisolated static func identity(of item: Item) -> AnyHashable?
+    nonisolated static func identity(of item: Item) -> RESTItemIdentity?
 }
 
 public extension PagedResponse {
@@ -63,7 +78,7 @@ public extension PagedResponse {
         100
     }
 
-    nonisolated static func identity(of _: Item) -> AnyHashable? {
+    nonisolated static func identity(of _: Item) -> RESTItemIdentity? {
         nil
     }
 }
@@ -320,6 +335,12 @@ public struct PaginatedRESTClient {
     /// Default number of attempts for idempotent requests, including the first attempt.
     nonisolated let maxAttempts: Int
 
+    /// Upper bound on HTTP attempts across one paginated list (retries included) (#123).
+    /// Defaults to ``maxSequentialPages`` × ``maxAttempts``. Parallel fetches also count
+    /// toward ``maxSequentialPages``, so that valve (not ``maxParallelPages`` alone) is
+    /// the page budget the retry multiplier must cover.
+    public nonisolated let maxPaginationHTTPAttempts: Int
+
     // `nonisolated` so actors and background containers can construct the client
     // without hopping to MainActor; stored state is immutable and Sendable.
     public nonisolated init(
@@ -333,7 +354,8 @@ public struct PaginatedRESTClient {
         maxSequentialPages: Int = Self.defaultMaxSequentialPages,
         maxParallelPages: Int = Self.defaultMaxParallelPages,
         maxRetryDelay: TimeInterval = Self.defaultMaxRetryDelay,
-        maxAttempts: Int = Self.defaultMaxAttempts
+        maxAttempts: Int = Self.defaultMaxAttempts,
+        maxPaginationHTTPAttempts: Int? = nil
     ) throws {
         self.init(
             apiKey: apiKey,
@@ -347,7 +369,8 @@ public struct PaginatedRESTClient {
             maxSequentialPages: maxSequentialPages,
             maxParallelPages: maxParallelPages,
             maxRetryDelay: maxRetryDelay,
-            maxAttempts: maxAttempts
+            maxAttempts: maxAttempts,
+            maxPaginationHTTPAttempts: maxPaginationHTTPAttempts
         )
     }
 
@@ -382,6 +405,7 @@ public struct PaginatedRESTClient {
         maxParallelPages: Int = Self.defaultMaxParallelPages,
         maxRetryDelay: TimeInterval = Self.defaultMaxRetryDelay,
         maxAttempts: Int = Self.defaultMaxAttempts,
+        maxPaginationHTTPAttempts: Int? = nil,
         rateLimitCooldown: RateLimitCooldown = RateLimitCooldown()
     ) {
         self.apiKey = Self.normalizedAPIKey(apiKey) ?? ""
@@ -397,6 +421,8 @@ public struct PaginatedRESTClient {
         self.maxParallelPages = max(1, maxParallelPages)
         self.maxRetryDelay = max(0, maxRetryDelay.isFinite ? maxRetryDelay : Self.defaultMaxRetryDelay)
         self.maxAttempts = max(1, maxAttempts)
+        let attemptBudget = maxPaginationHTTPAttempts ?? (self.maxSequentialPages * self.maxAttempts)
+        self.maxPaginationHTTPAttempts = max(1, attemptBudget)
         self.rateLimitCooldown = rateLimitCooldown
     }
 
@@ -415,6 +441,7 @@ public struct PaginatedRESTClient {
             maxParallelPages: maxParallelPages,
             maxRetryDelay: maxRetryDelay,
             maxAttempts: maxAttempts,
+            maxPaginationHTTPAttempts: maxPaginationHTTPAttempts,
             rateLimitCooldown: RateLimitCooldown()
         )
     }
@@ -434,6 +461,7 @@ public struct PaginatedRESTClient {
             maxParallelPages: maxParallelPages,
             maxRetryDelay: maxRetryDelay,
             maxAttempts: maxAttempts,
+            maxPaginationHTTPAttempts: maxPaginationHTTPAttempts,
             rateLimitCooldown: other.rateLimitCooldown
         )
     }
@@ -505,7 +533,8 @@ public struct PaginatedRESTClient {
     private nonisolated func performWithRetryAttempt<T: Decodable & Sendable>(
         _ type: T.Type,
         request: RESTRequest,
-        maxAttempts: Int? = nil
+        maxAttempts: Int? = nil,
+        attemptBudget: PaginationHTTPAttemptBudget? = nil
     ) async throws -> DecodedAttempt<T> {
         let attempts = maxAttempts ?? self.maxAttempts
         guard attempts > 0 else { throw errors.decode("maxAttempts must be positive") }
@@ -514,6 +543,7 @@ public struct PaginatedRESTClient {
         var attempt = 0
         while true {
             do {
+                try attemptBudget?.consume()
                 return try await performAttempt(type, request: request)
             } catch let failure as HTTPAttemptFailure {
                 attempt += 1
@@ -1584,7 +1614,15 @@ nonisolated func drivePagination<W: PagedResponse>(
 
     guard let firstURL = pageURL(nil) else { throw errors.invalidRequest("Invalid URL") }
 
-    let firstAttempt = try await performWithRetryAttempt(W.self, request: try authorizedGET(firstURL))
+    let attemptBudget = PaginationHTTPAttemptBudget(
+        limit: maxPaginationHTTPAttempts,
+        errors: errors
+    )
+    let firstAttempt = try await performWithRetryAttempt(
+        W.self,
+        request: try authorizedGET(firstURL),
+        attemptBudget: attemptBudget
+    )
     let firstPage = firstAttempt.value
     let numberedTemplate = try firstPage.nextPage.flatMap {
         try validatedNextPageURL($0, relativeTo: firstAttempt.responseURL)
@@ -1623,13 +1661,17 @@ nonisolated func drivePagination<W: PagedResponse>(
         guard estimatedPageCount <= maxParallelPages else {
             throw errors.invalidRequest("Pagination exceeded \(maxParallelPages) parallel pages")
         }
+        // Parallel pages count toward the same total-page valve as the sequential tail.
+        guard estimatedPageCount <= maxSequentialPages else {
+            throw errors.invalidRequest("Pagination exceeded \(maxSequentialPages) total pages")
+        }
     }
 
     var visitedPageURLs: Set<URL> = [canonicalPageURL(firstURL)]
     // `seen` de-dupes by each item's stable identity across every page, so an
     // over-requested page that echoes page 1 can't duplicate rows. Only consulted
     // when `canDeduplicate` is true (parallel path).
-    var seen = Set<AnyHashable>()
+    var seen = Set<RESTItemIdentity>()
     var items: [W.Item] = []
     Self.appendNew(
         firstPage.pageItems,
@@ -1642,40 +1684,16 @@ nonisolated func drivePagination<W: PagedResponse>(
 
     if considerParallel, estimatedPageCount > 1, let total = firstPage.total {
         guard let numberedTemplate else { throw errors.invalidRequest("Invalid pagination template") }
-        func numberedPageURL(_ page: Int?) -> URL? {
-            guard let page else { return firstURL }
-            guard let overlaid = Self.overlayingPercentEncodedQuery(
-                from: numberedTemplate,
-                onto: firstURL
-            ) else { return nil }
-            return Self.replacingPercentEncodedQueryFields(
-                in: overlaid,
-                replacements: [(name: "page", value: String(page))]
-            )
-        }
-        let (tailNextPage, tailResponseURL) = try await fetchKnownPages(
+        try await completeParallelPagination(
             W.self,
+            firstURL: firstURL,
+            numberedTemplate: numberedTemplate,
             total: total,
             pageCount: estimatedPageCount,
             items: &items,
             seen: &seen,
-            pageURL: numberedPageURL,
-            emit: emit
-        )
-        for page in 2 ... estimatedPageCount {
-            if let url = numberedPageURL(page) {
-                visitedPageURLs.insert(canonicalPageURL(url))
-            }
-        }
-        try await walkNextPages(
-            W.self,
-            from: tailNextPage,
-            relativeTo: tailResponseURL,
-            items: &items,
-            seen: &seen,
             visitedPageURLs: &visitedPageURLs,
-            pagesAlreadyFetched: estimatedPageCount,
-            deduplicate: true,
+            attemptBudget: attemptBudget,
             emit: emit
         )
         return items
@@ -1691,9 +1709,88 @@ nonisolated func drivePagination<W: PagedResponse>(
         visitedPageURLs: &visitedPageURLs,
         pagesAlreadyFetched: 1,
         deduplicate: canDeduplicate,
+        attemptBudget: attemptBudget,
         emit: emit
     )
     return items
+}
+
+/// Parallel numbered pages, then any `next_page` remainder past the estimate.
+nonisolated func completeParallelPagination<W: PagedResponse>(
+    _: W.Type,
+    firstURL: URL,
+    numberedTemplate: URL,
+    total: Int,
+    pageCount: Int,
+    items: inout [W.Item],
+    seen: inout Set<RESTItemIdentity>,
+    visitedPageURLs: inout Set<URL>,
+    attemptBudget: PaginationHTTPAttemptBudget,
+    emit: @Sendable ([W.Item]) -> Void
+) async throws {
+    func numberedPageURL(_ page: Int?) -> URL? {
+        guard let page else { return firstURL }
+        guard let overlaid = Self.overlayingPercentEncodedQuery(
+            from: numberedTemplate,
+            onto: firstURL
+        ) else { return nil }
+        return Self.replacingPercentEncodedQueryFields(
+            in: overlaid,
+            replacements: [(name: "page", value: String(page))]
+        )
+    }
+    let (tailNextPage, tailResponseURL) = try await fetchKnownPages(
+        W.self,
+        total: total,
+        pageCount: pageCount,
+        items: &items,
+        seen: &seen,
+        pageURL: numberedPageURL,
+        attemptBudget: attemptBudget,
+        emit: emit
+    )
+    for page in 2 ... pageCount {
+        if let url = numberedPageURL(page) {
+            visitedPageURLs.insert(canonicalPageURL(url))
+        }
+    }
+    try await walkNextPages(
+        W.self,
+        from: tailNextPage,
+        relativeTo: tailResponseURL,
+        items: &items,
+        seen: &seen,
+        visitedPageURLs: &visitedPageURLs,
+        pagesAlreadyFetched: pageCount,
+        deduplicate: true,
+        attemptBudget: attemptBudget,
+        emit: emit
+    )
+}
+
+/// Counts HTTP attempts for one paginated list so retries cannot amplify page caps (#123).
+nonisolated final class PaginationHTTPAttemptBudget: @unchecked Sendable {
+    private let lock = NSLock()
+    private var remaining: Int
+    private let limit: Int
+    private let errors: any RESTTransportErrorMapping
+
+    nonisolated init(limit: Int, errors: any RESTTransportErrorMapping) {
+        self.remaining = limit
+        self.limit = limit
+        self.errors = errors
+    }
+
+    nonisolated func consume() throws {
+        try lock.withLock {
+            guard remaining > 0 else {
+                throw errors.invalidRequest(
+                    "Pagination exceeded \(limit) HTTP attempts (pages × retries)"
+                )
+            }
+            remaining -= 1
+        }
+    }
 }
 
 /// Appends items, optionally de-duplicating by `PagedResponse` identity. When
@@ -1704,8 +1801,8 @@ nonisolated func drivePagination<W: PagedResponse>(
 nonisolated static func appendNew<Item>(
     _ newItems: [Item],
     to items: inout [Item],
-    seen: inout Set<AnyHashable>,
-    identity: (Item) -> AnyHashable?,
+    seen: inout Set<RESTItemIdentity>,
+    identity: (Item) -> RESTItemIdentity?,
     deduplicate: Bool
 ) -> Int {
     guard deduplicate else {
@@ -1722,6 +1819,19 @@ nonisolated static func appendNew<Item>(
     return appended
 }
 
+/// Speculative parallel page slot: either a loaded page or a stale-total 404 gap.
+private enum ParallelPendingPage<Page> {
+    case loaded(page: Page, responseURL: URL)
+    /// Speculative page past the live list (stale `total`); keep prior records.
+    case missing
+}
+
+/// Outcome of one speculative parallel page request.
+private enum ParallelPageFetchOutcome<Page: Sendable>: Sendable {
+    case success(Int, Page, URL)
+    case notFound(Int)
+}
+
 /// Fetches pages 2…N concurrently (bounded window), appending each completed page in
 /// contiguous order and emitting a snapshot whenever the ordered prefix grows. Returns
 /// the `next_page` of the final estimated page when that page was in range, so the
@@ -1731,8 +1841,9 @@ nonisolated func fetchKnownPages<W: PagedResponse>(
     total _: Int,
     pageCount: Int,
     items: inout [W.Item],
-    seen: inout Set<AnyHashable>,
+    seen: inout Set<RESTItemIdentity>,
     pageURL: (Int?) -> URL?,
+    attemptBudget: PaginationHTTPAttemptBudget,
     emit: @Sendable ([W.Item]) -> Void
 ) async throws -> (nextPage: String?, responseURL: URL) {
     // `total` is a lower bound on the page count: it can undercount if records are
@@ -1750,19 +1861,10 @@ nonisolated func fetchKnownPages<W: PagedResponse>(
     // a legitimate duplicate-only page caused by concurrent list drift.
     var tailNextPage: String?
     var tailResponseURL = pageURL(pageCount) ?? baseURL
-    enum PendingPage {
-        case loaded(page: W, responseURL: URL)
-        /// Speculative page past the live list (stale `total`); keep prior records.
-        case missing
-    }
-    var pending: [Int: PendingPage] = [:]
+    var pending: [Int: ParallelPendingPage<W>] = [:]
     var nextToEmit = 2
     var collected = items
-    enum PageFetchOutcome: Sendable {
-        case success(Int, W, URL)
-        case notFound(Int)
-    }
-    try await withThrowingTaskGroup(of: PageFetchOutcome.self) { group in
+    try await withThrowingTaskGroup(of: ParallelPageFetchOutcome<W>.self) { group in
         func enqueue(_ page: Int) throws {
             guard let url = pageURL(page) else { throw errors.invalidRequest("Invalid URL") }
 
@@ -1770,7 +1872,8 @@ nonisolated func fetchKnownPages<W: PagedResponse>(
                 do {
                     let attempt = try await performWithRetryAttempt(
                         W.self,
-                        request: try authorizedGET(url)
+                        request: try authorizedGET(url),
+                        attemptBudget: attemptBudget
                     )
                     return .success(page, attempt.value, attempt.responseURL)
                 } catch {
@@ -1924,10 +2027,11 @@ nonisolated func walkNextPages<W: PagedResponse>(
     from start: String?,
     relativeTo startBase: URL,
     items: inout [W.Item],
-    seen: inout Set<AnyHashable>,
+    seen: inout Set<RESTItemIdentity>,
     visitedPageURLs: inout Set<URL>,
     pagesAlreadyFetched: Int,
     deduplicate: Bool,
+    attemptBudget: PaginationHTTPAttemptBudget,
     emit: @Sendable ([W.Item]) -> Void
 ) async throws {
     var url = try start.flatMap { try validatedNextPageURL($0, relativeTo: startBase) }
@@ -1942,7 +2046,8 @@ nonisolated func walkNextPages<W: PagedResponse>(
 
         let attempt = try await performWithRetryAttempt(
             W.self,
-            request: try authorizedGET(current)
+            request: try authorizedGET(current),
+            attemptBudget: attemptBudget
         )
         let page = attempt.value
         let added = Self.appendNew(
