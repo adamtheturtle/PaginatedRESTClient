@@ -1276,6 +1276,55 @@ struct RateLimitRetryTests {
     }
 
     @Test
+    func `a rate limit does not stall a different origin`() async throws {
+        let sleeper = ControlledSleeper()
+        let transport = TerminalRateLimitTransport()
+        let client = makeClient(
+            transport: transport,
+            retryRuntime: RetryRuntime(
+                now: { Date(timeIntervalSince1970: 0) },
+                sleep: { try await sleeper.sleep(for: $0) },
+                jitter: { 0 }
+            )
+        )
+        let limited = RESTRequest(
+            url: try #require(URL(string: "https://uploads.example.test/limited")),
+            method: "GET"
+        )
+        await #expect(throws: TestErrors.Failure.http(429)) {
+            _ = try await client.performWithRetry(Thing.self, request: limited, maxAttempts: 1)
+        }
+
+        let next = RESTRequest(
+            url: try #require(URL(string: "https://example.test/next")),
+            method: "GET"
+        )
+        #expect(try await client.performWithRetry(Thing.self, request: next, maxAttempts: 1) == Thing(id: 1))
+        #expect(sleeper.requestedDelays.isEmpty)
+    }
+
+    @Test
+    func `repeated rate limits cannot extend one cooldown past its cap`() {
+        let cooldown = RateLimitCooldown()
+        let start = Date(timeIntervalSince1970: 0)
+        cooldown.extend(
+            until: start.addingTimeInterval(60),
+            observedAt: start,
+            maximumWindow: 60,
+            for: "https://example.test:443"
+        )
+        let later = start.addingTimeInterval(30)
+        cooldown.extend(
+            until: later.addingTimeInterval(60),
+            observedAt: later,
+            maximumWindow: 60,
+            for: "https://example.test:443"
+        )
+
+        #expect(cooldown.remaining(at: later, for: "https://example.test:443") == 30)
+    }
+
+    @Test
     func `cancellation interrupts a Retry-After wait without another request`() async throws {
         let transport = RetryOnceTransport(retryAfter: "3600")
         let client = makeClient(transport: transport)
