@@ -127,20 +127,27 @@ public nonisolated struct RESTResponse: Sendable {
 /// `network(_:)` case; any other thrown error propagates and is offered to the mapping's
 /// `isTransient(_:)` for the retry decision.
 public protocol RESTTransport: Sendable {
-    /// Execute a request, returning the response body and HTTP status code.
-    ///
-    /// `nonisolated` (like `RESTTransportErrorMapping`) so the paginator can call it from
-    /// the off-main pagination pipeline rather than pinning it to the module's default
-    /// MainActor isolation.
-    nonisolated func data(for request: RESTRequest) async throws -> (Data, Int)
-
-    /// Execute a request while retaining response headers. Existing transports that only
-    /// implement ``data(for:)`` inherit a compatibility implementation with empty headers;
-    /// transports should implement this requirement when retry policy needs response metadata.
+    /// Execute a request while retaining its response body, status, and headers.
     nonisolated func response(for request: RESTRequest) async throws -> RESTResponse
 }
 
 public extension RESTTransport {
+    /// A convenience projection for consumers that do not need response headers.
+    nonisolated func data(for request: RESTRequest) async throws -> (Data, Int) {
+        let response = try await response(for: request)
+        return (response.data, response.statusCode)
+    }
+}
+
+/// Compatibility protocol for transports written against the original byte-and-status
+/// seam. Prefer conforming new transports directly to ``RESTTransport`` so headers are
+/// available to retry logic. This protocol deliberately owns the one-way adapter, avoiding
+/// recursive defaults between the legacy and modern requirements.
+public protocol LegacyRESTTransport: RESTTransport {
+    nonisolated func data(for request: RESTRequest) async throws -> (Data, Int)
+}
+
+public extension LegacyRESTTransport {
     nonisolated func response(for request: RESTRequest) async throws -> RESTResponse {
         let (data, statusCode) = try await data(for: request)
         return RESTResponse(data: data, statusCode: statusCode)

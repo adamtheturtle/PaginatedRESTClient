@@ -198,7 +198,7 @@ private nonisolated final class RequestLog: @unchecked Sendable {
 
 /// Serves a list defined by `pages` (page 1 first) and a policy for pages past the end,
 /// so each regression test can describe the server behaviour it needs.
-private nonisolated struct ScriptedTransport: RESTTransport {
+private nonisolated struct ScriptedTransport: LegacyRESTTransport {
     /// How the server treats a `page` beyond the last real page.
     enum OutOfRange: Sendable {
         /// 404 - not classified as transient, so it fails the whole load.
@@ -238,7 +238,7 @@ private nonisolated struct ScriptedTransport: RESTTransport {
 }
 
 /// Serves a single first page verbatim, for the `total`-validation tests.
-private nonisolated struct FixedFirstPageTransport: RESTTransport {
+private nonisolated struct FixedFirstPageTransport: LegacyRESTTransport {
     let json: String
 
     func data(for _: RESTRequest) async throws -> (Data, Int) {
@@ -262,7 +262,7 @@ private nonisolated final class CapturedRequests: @unchecked Sendable {
     }
 }
 
-private nonisolated struct NextPageTransport: RESTTransport {
+private nonisolated struct NextPageTransport: LegacyRESTTransport {
     let nextPage: String
     let laterNextPage: String?
     let captured: CapturedRequests
@@ -289,7 +289,7 @@ private nonisolated struct NextPageTransport: RESTTransport {
     }
 }
 
-private nonisolated struct CycleTransport: RESTTransport {
+private nonisolated struct CycleTransport: LegacyRESTTransport {
     enum Kind: Sendable {
         case selfLoop
         case twoPages
@@ -322,7 +322,7 @@ private nonisolated struct CycleTransport: RESTTransport {
 /// networking - a `RESTTransport` stub in place of the old `URLProtocol`/`URLSession`
 /// machinery, so the tests exercise the paginator over the same seam consumers use and
 /// stay Foundation-only (Linux-clean).
-private struct StubTransport: RESTTransport {
+private struct StubTransport: LegacyRESTTransport {
     func data(for request: RESTRequest) async throws -> (Data, Int) {
         let page = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?
             .queryItems?.first { $0.name == "page" }?.value
@@ -338,7 +338,7 @@ private struct StubTransport: RESTTransport {
     }
 }
 
-private nonisolated struct QueryCaptureTransport: RESTTransport {
+private nonisolated struct QueryCaptureTransport: LegacyRESTTransport {
     let captured: CapturedRequests
 
     func data(for request: RESTRequest) async throws -> (Data, Int) {
@@ -347,12 +347,19 @@ private nonisolated struct QueryCaptureTransport: RESTTransport {
     }
 }
 
-private nonisolated struct FixedResponseTransport: RESTTransport {
+private nonisolated struct FixedResponseTransport: LegacyRESTTransport {
     let data: Data
     let status: Int
 
     func data(for _: RESTRequest) async throws -> (Data, Int) {
         (data, status)
+    }
+}
+
+/// A modern transport needs only the header-aware requirement.
+private nonisolated struct ResponseOnlyTransport: RESTTransport {
+    func response(for _: RESTRequest) async throws -> RESTResponse {
+        RESTResponse(data: Data(#"{"id":1}"#.utf8), statusCode: 200, headers: ["X-Source": "modern"])
     }
 }
 
@@ -419,7 +426,7 @@ private nonisolated func waitUntil(
 
 /// Returns one rate limit response followed by a success, retaining mixed-case headers
 /// to exercise the header-aware transport path and case-insensitive lookup together.
-private nonisolated final class RetryOnceTransport: RESTTransport, @unchecked Sendable {
+private nonisolated final class RetryOnceTransport: LegacyRESTTransport, @unchecked Sendable {
     private let lock = NSLock()
     private var attempts = 0
     let retryAfter: String?
@@ -455,7 +462,7 @@ private nonisolated final class RetryOnceTransport: RESTTransport, @unchecked Se
     }
 }
 
-private nonisolated final class CountingStatusTransport: RESTTransport, @unchecked Sendable {
+private nonisolated final class CountingStatusTransport: LegacyRESTTransport, @unchecked Sendable {
     private let lock = NSLock()
     private var attempts = 0
     let status: Int
@@ -473,7 +480,7 @@ private nonisolated final class CountingStatusTransport: RESTTransport, @uncheck
     var requestCount: Int { lock.withLock { attempts } }
 }
 
-private nonisolated final class TerminalRateLimitTransport: RESTTransport, @unchecked Sendable {
+private nonisolated final class TerminalRateLimitTransport: LegacyRESTTransport, @unchecked Sendable {
     private let lock = NSLock()
     private var paths: [String] = []
 
@@ -501,7 +508,7 @@ private nonisolated final class TerminalRateLimitTransport: RESTTransport, @unch
 
 /// Makes pages 2 and 3 reach their first 429 together, then serves both successfully.
 /// The barrier prevents scheduler order from weakening the shared-cooldown assertion.
-private nonisolated final class ConcurrentRateLimitTransport: RESTTransport, @unchecked Sendable {
+private nonisolated final class ConcurrentRateLimitTransport: LegacyRESTTransport, @unchecked Sendable {
     private let lock = NSLock()
     private var attempts: [Int: Int] = [:]
     private var rateLimited: [CheckedContinuation<RESTResponse, Never>] = []
@@ -581,6 +588,13 @@ private func makeClient(
 
 @Suite("PaginatedRESTClient")
 struct PaginatedRESTClientTests {
+    @Test
+    func `a header-aware transport conforms without a legacy data method`() async throws {
+        let client = makeClient(transport: ResponseOnlyTransport())
+        let value = try await client.fetch(Thing.self, path: "/value")
+        #expect(value == Thing(id: 1))
+    }
+
     @Test
     func `custom decoding failures use the configured mapping`() async throws {
         let client = PaginatedRESTClient(
@@ -884,7 +898,7 @@ extension PaginatedRESTClientTests {
 
     @Test
     func `a non-2xx status surfaces as a mapped HTTP error`() async throws {
-        struct FailingTransport: RESTTransport {
+        struct FailingTransport: LegacyRESTTransport {
             func data(for _: RESTRequest) async throws -> (Data, Int) {
                 (Data("nope".utf8), 404)
             }
@@ -1374,7 +1388,7 @@ private nonisolated struct ZeroPageSize: PagedResponse {
 }
 
 /// Serves sequential pages from a fixed chain of JSON bodies, keyed by request order.
-private nonisolated struct SequentialJSONTransport: RESTTransport {
+private nonisolated struct SequentialJSONTransport: LegacyRESTTransport {
     let pages: [String]
     let captured: CapturedRequests
 
@@ -1385,7 +1399,7 @@ private nonisolated struct SequentialJSONTransport: RESTTransport {
     }
 }
 
-private nonisolated struct CapturingFixedTransport: RESTTransport {
+private nonisolated struct CapturingFixedTransport: LegacyRESTTransport {
     let inner: FixedResponseTransport
     let captured: CapturedRequests
 
@@ -1396,7 +1410,7 @@ private nonisolated struct CapturingFixedTransport: RESTTransport {
 }
 
 /// Parallel-aware stub: page 1 is fixed JSON; later `page` query values are served from `later`.
-private nonisolated struct FirstThenNumberedTransport: RESTTransport {
+private nonisolated struct FirstThenNumberedTransport: LegacyRESTTransport {
     let first: String
     let later: [Int: String]
     let captured: CapturedRequests
@@ -1664,7 +1678,7 @@ struct PaginationIssueRegressionTests {
     }
 }
 
-private nonisolated struct CancellationProbeTransport: RESTTransport {
+private nonisolated struct CancellationProbeTransport: LegacyRESTTransport {
     func data(for _: RESTRequest) async throws -> (Data, Int) {
         throw CancellationError()
     }

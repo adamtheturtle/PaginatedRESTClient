@@ -4,16 +4,16 @@
 
 ```swift
 public protocol RESTTransport: Sendable {
-    func data(for request: RESTRequest) async throws -> (Data, Int)
     func response(for request: RESTRequest) async throws -> RESTResponse
 }
 ```
 
 A transport executes a ``RESTRequest`` and returns the response body, HTTP status code, and
 headers. The paginator uses `Retry-After` to coordinate rate-limit cooldowns across concurrent
-page requests. Existing transports only need `data(for:)`: the protocol supplies a compatible
-`response(for:)` with empty headers, although those transports cannot honor `Retry-After` until
-they implement the header-aware method.
+page requests. Implement `response(for:)` directly for every new transport. The convenience
+`data(for:)` projection remains available when a caller does not need headers. Legacy transports
+can temporarily conform to `LegacyRESTTransport`, whose one-way adapter supplies
+an empty header collection.
 
 That's the whole contract - **no decoding, no retry, no auth.** All of that stays in the
 paginator, so a transport is a thin translation from ``RESTRequest`` to whatever your HTTP
@@ -50,11 +50,6 @@ import PaginatedRESTClient
 /// A `RESTTransport` backed by a Get `APIClient`.
 struct GetTransport: RESTTransport {
     let client: APIClient
-
-    func data(for request: RESTRequest) async throws -> (Data, Int) {
-        let response = try await response(for: request)
-        return (response.data, response.statusCode)
-    }
 
     func response(for request: RESTRequest) async throws -> RESTResponse {
         var get = Request<Void>(
@@ -117,11 +112,6 @@ import PaginatedRESTClient
 /// A `RESTTransport` backed by an Alamofire `Session`.
 struct AlamofireTransport: RESTTransport {
     let session: Session
-
-    func data(for request: RESTRequest) async throws -> (Data, Int) {
-        let response = try await response(for: request)
-        return (response.data, response.statusCode)
-    }
 
     func response(for request: RESTRequest) async throws -> RESTResponse {
         var urlRequest = URLRequest(url: request.url)
