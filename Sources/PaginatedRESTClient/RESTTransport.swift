@@ -23,9 +23,24 @@ public nonisolated struct RESTRequest: Sendable {
     public var url: URL
     /// The HTTP method, e.g. `"GET"` or `"POST"`.
     public var method: String
-    /// Request headers. The paginator sets `Authorization` (and `Accept`/`Content-Type`)
-    /// here; a transport should pass them through verbatim.
-    public var headers: [String: String]
+    /// Ordered request header fields. Repeated names are preserved as separate fields
+    /// (#135). Transports should emit each entry as its own field line when the
+    /// underlying client supports that; otherwise joining is the transport's choice.
+    public var headerFields: [(name: String, value: String)]
+    /// Convenience dictionary view of ``headerFields`` (last value wins per name).
+    /// Assigning replaces ``headerFields`` with one entry per dictionary key.
+    public var headers: [String: String] {
+        get {
+            headerFields.reduce(into: [String: String]()) { result, field in
+                result[field.name] = field.value
+            }
+        }
+        set {
+            headerFields = newValue
+                .sorted { $0.key.lowercased() < $1.key.lowercased() }
+                .map { (name: $0.key, value: $0.value) }
+        }
+    }
     /// The request body, already encoded, or `nil` for bodyless requests like GET.
     public var body: Data?
     /// A local file to stream as the request body without first loading it into
@@ -42,7 +57,23 @@ public nonisolated struct RESTRequest: Sendable {
     ) {
         self.url = url
         self.method = method
-        self.headers = headers
+        self.headerFields = headers
+            .sorted { $0.key.lowercased() < $1.key.lowercased() }
+            .map { (name: $0.key, value: $0.value) }
+        self.body = body
+        self.bodyFileURL = bodyFileURL
+    }
+
+    public nonisolated init(
+        url: URL,
+        method: String,
+        headerFields: [(name: String, value: String)],
+        body: Data? = nil,
+        bodyFileURL: URL? = nil
+    ) {
+        self.url = url
+        self.method = method
+        self.headerFields = headerFields
         self.body = body
         self.bodyFileURL = bodyFileURL
     }
@@ -58,15 +89,20 @@ public nonisolated struct RESTRequest: Sendable {
         guard Self.isHTTPURL(url) else {
             throw RESTRequestError.unsupportedURL(url)
         }
-        guard headers.allSatisfy({ Self.isValidHeaderName($0.key) && Self.isValidHeaderValue($0.value) }) else {
+        guard headerFields.allSatisfy({
+            Self.isValidHeaderName($0.name) && Self.isValidHeaderValue($0.value)
+        }) else {
             throw RESTRequestError.invalidHeaderField
         }
-        var seenNames = Set<String>()
-        for name in headers.keys {
-            let canonical = name.lowercased()
-            guard seenNames.insert(canonical).inserted else {
-                throw RESTRequestError.duplicateHeaderField(name)
+        // Exact-name repeats are intentional (#135). Case-variant spellings of the same
+        // field name are not, because HTTP field names are case-insensitive (#99).
+        var firstSpelling: [String: String] = [:]
+        for field in headerFields {
+            let canonical = field.name.lowercased()
+            if let existing = firstSpelling[canonical], existing != field.name {
+                throw RESTRequestError.duplicateHeaderField(field.name)
             }
+            firstSpelling[canonical] = field.name
         }
     }
 

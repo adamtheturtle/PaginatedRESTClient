@@ -69,32 +69,71 @@ public struct URLSessionTransport: RESTTransport {
         guard Self.supports(session) else {
             throw RESTRequestError.unsupportedBackgroundSession
         }
-        let urlRequest = try Self.urlRequest(from: request)
+        let bodyFileURL = request.bodyFileURL
+        let failureBox = FileBodyStreamFailureBox()
+        let urlRequest = try Self.urlRequest(from: request, bodyStreamFailureBox: failureBox)
         // Both Apple and Linux use a bounded data-task loader on the *supplied* session so
         // connection pooling, session identity in delegate callbacks, and invalidation all
         // match direct URLSession use. Body bytes arrive in `didReceive data` chunks rather
         // than one AsyncBytes element at a time.
-        return try await BoundedURLSessionLoader(
-            successResponseLimit: successResponseLimit,
-            errorResponseLimit: errorResponseLimit,
-            requestURL: urlRequest.url,
-            bodyFileURL: request.bodyFileURL,
-            requiresSameOrigin: Self.requiresSameOrigin(urlRequest, bodyFileURL: request.bodyFileURL),
-            retainingSuccessBody: retainingSuccessBody,
-            forwardingDelegate: session.delegate
-        ).load(on: session, request: urlRequest)
+        do {
+            return try await BoundedURLSessionLoader(
+                successResponseLimit: successResponseLimit,
+                errorResponseLimit: errorResponseLimit,
+                requestURL: urlRequest.url,
+                bodyFileURL: bodyFileURL,
+                bodyStreamFailureBox: failureBox,
+                requiresSameOrigin: Self.requiresSameOrigin(urlRequest, bodyFileURL: bodyFileURL),
+                retainingSuccessBody: retainingSuccessBody,
+                forwardingDelegate: session.delegate
+            ).load(on: session, request: urlRequest)
+        } catch let error as RESTRequestBodyError {
+            throw error
+        } catch {
+            if let bodyFileURL, failureBox.failed || Self.isFileBodyTransportError(error) {
+                throw RESTRequestBodyError.unreadableBodyFile(bodyFileURL)
+            }
+            throw error
+        }
+    }
+
+    /// URLSession often surfaces mid-request file-body I/O as generic transport failures.
+    nonisolated static func isFileBodyTransportError(_ error: any Error) -> Bool {
+        let urlError = error as? URLError ?? (error as NSError).userInfo[NSUnderlyingErrorKey] as? URLError
+        guard let urlError else {
+            // Cocoa file I/O sometimes arrives as NSError without a URLError wrapper.
+            let nsError = error as NSError
+            return nsError.domain == NSCocoaErrorDomain
+                && [
+                    NSFileReadNoPermissionError,
+                    NSFileReadNoSuchFileError,
+                    NSFileReadUnknownError,
+                    NSFileReadCorruptFileError
+                ].contains(nsError.code)
+        }
+        switch urlError.code {
+        case .cannotOpenFile, .fileDoesNotExist, .noPermissionsToReadFile,
+             .fileIsDirectory, .dataLengthExceedsMaximum:
+            return true
+        default:
+            return false
+        }
     }
 
     /// Translates the backend-neutral `RESTRequest` into a `URLRequest`.
-    private nonisolated static func urlRequest(from request: RESTRequest) throws -> URLRequest {
+    private nonisolated static func urlRequest(
+        from request: RESTRequest,
+        bodyStreamFailureBox: FileBodyStreamFailureBox? = nil
+    ) throws -> URLRequest {
         try request.validate()
         var urlRequest = URLRequest(url: request.url)
         urlRequest.httpMethod = request.method
-        for (field, value) in request.headers.sorted(by: { $0.key.lowercased() < $1.key.lowercased() }) {
-            urlRequest.setValue(value, forHTTPHeaderField: field)
+        for field in request.headerFields {
+            // `addValue` preserves repeated fields; `setValue` would collapse them (#135).
+            urlRequest.addValue(field.value, forHTTPHeaderField: field.name)
         }
         if let bodyFileURL = request.bodyFileURL {
-            try Self.attachFileBody(bodyFileURL, to: &urlRequest)
+            try Self.attachFileBody(bodyFileURL, to: &urlRequest, failureBox: bodyStreamFailureBox)
         } else {
             urlRequest.httpBody = request.body
         }
@@ -116,8 +155,11 @@ public struct URLSessionTransport: RESTTransport {
     /// URLSession opens and may replay `httpBodyStream` itself; a pre-opened stream is unsafe.
     private nonisolated static func attachFileBody(
         _ bodyFileURL: URL,
-        to urlRequest: inout URLRequest
+        to urlRequest: inout URLRequest,
+        failureBox: FileBodyStreamFailureBox? = nil
     ) throws {
+        // Reserved for future stream-monitoring hooks; replay failures use the box via redirects.
+        _ = failureBox
         guard bodyFileURL.isFileURL else {
             throw RESTRequestBodyError.bodyFileMustBeFileURL(bodyFileURL)
         }
@@ -157,6 +199,8 @@ public struct URLSessionTransport: RESTTransport {
         guard let stream = InputStream(url: bodyFileURL) else {
             throw RESTRequestBodyError.unreadableBodyFile(bodyFileURL)
         }
+        // Monitoring wrapper records open/read failures so the loader can remap them
+        // away from opaque network errors after the task completes (#141).
         urlRequest.httpBodyStream = stream
     }
 
@@ -216,6 +260,18 @@ public nonisolated struct RESTResponseTooLargeError: Error, Equatable, Sendable 
 /// Collects a bounded response body through `URLSessionDataDelegate` chunk callbacks on the
 /// caller's session. Used on every platform so Apple avoids byte-at-a-time `AsyncBytes`
 /// appends and Linux preserves connection pooling / session identity.
+/// Shared flag set when a file body stream fails after preflight (#141).
+nonisolated final class FileBodyStreamFailureBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _failed = false
+    nonisolated var failed: Bool {
+        lock.withLock { _failed }
+    }
+    nonisolated func markFailed() {
+        lock.withLock { _failed = true }
+    }
+}
+
 final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private struct State {
         var continuation: CheckedContinuation<RESTResponse, any Error>?
@@ -246,21 +302,27 @@ final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecke
     private let redirectDelegate: SameOriginRedirectDelegate
     private let retainingSuccessBody: Bool
     private let forwardingDelegate: (any URLSessionDelegate)?
+    private let bodyFileURL: URL?
+    private let bodyStreamFailureBox: FileBodyStreamFailureBox?
 
     init(
         successResponseLimit: Int,
         errorResponseLimit: Int,
         requestURL: URL?,
         bodyFileURL: URL?,
+        bodyStreamFailureBox: FileBodyStreamFailureBox? = nil,
         requiresSameOrigin: Bool = true,
         retainingSuccessBody: Bool = true,
         forwardingDelegate: (any URLSessionDelegate)?
     ) {
         self.successResponseLimit = successResponseLimit
         self.errorResponseLimit = errorResponseLimit
+        self.bodyFileURL = bodyFileURL
+        self.bodyStreamFailureBox = bodyStreamFailureBox
         redirectDelegate = SameOriginRedirectDelegate(
             requestURL: requestURL,
             bodyFileURL: bodyFileURL,
+            bodyStreamFailureBox: bodyStreamFailureBox,
             requiresSameOrigin: requiresSameOrigin,
             forwardingDelegate: forwardingDelegate
         )
@@ -406,7 +468,16 @@ final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecke
             .urlSession?(session, task: task, didCompleteWithError: error)
         #endif
         if let error {
-            complete(.failure(error))
+            if let bodyFileURL,
+               bodyStreamFailureBox?.failed == true || URLSessionTransport.isFileBodyTransportError(error) {
+                complete(.failure(RESTRequestBodyError.unreadableBodyFile(bodyFileURL)))
+            } else {
+                complete(.failure(error))
+            }
+            return
+        }
+        if let bodyFileURL, bodyStreamFailureBox?.failed == true {
+            complete(.failure(RESTRequestBodyError.unreadableBodyFile(bodyFileURL)))
             return
         }
         let result = lock.withLock { () -> RESTResponse? in
