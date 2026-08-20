@@ -33,7 +33,7 @@ public nonisolated struct RESTRequest: Sendable {
     /// Supplying both body sources is rejected by ``URLSessionTransport``.
     public var bodyFileURL: URL?
 
-    public init(
+    public nonisolated init(
         url: URL,
         method: String,
         headers: [String: String] = [:],
@@ -56,30 +56,47 @@ public nonisolated enum RESTRequestBodyError: Error, Equatable, Sendable {
     case bodyFileMustBeFileURL(URL)
     /// The local body file did not exist or was not readable before the request began.
     case unreadableBodyFile(URL)
+    /// A caller-supplied `Content-Length` did not match the opened body file's size.
+    case contentLengthMismatch(expected: Int, declared: String)
 }
 
 /// The raw result of one HTTP request. Header names are matched case-insensitively by
 /// ``value(forHTTPHeaderField:)`` because HTTP field names are case-insensitive.
+///
+/// ``statusCode`` must be a real HTTP status (`100...599`). Values outside that range
+/// are rejected at construction so a broken custom transport cannot masquerade as HTTP.
 public nonisolated struct RESTResponse: Sendable {
     public var data: Data
     public var statusCode: Int
-    public var headers: [String: String]
+    /// Normalized response headers (lowercase names, first-wins for case variants).
+    /// Assigning re-runs canonicalization so the normalized invariant cannot be broken.
+    public var headers: [String: String] {
+        get { normalizedHeaders }
+        set { normalizedHeaders = Self.canonicalized(newValue) }
+    }
 
-    public init(data: Data, statusCode: Int, headers: [String: String] = [:]) {
+    private var normalizedHeaders: [String: String]
+
+    public nonisolated init(data: Data, statusCode: Int, headers: [String: String] = [:]) {
+        precondition(
+            (100 ... 599).contains(statusCode),
+            "RESTResponse statusCode must be a valid HTTP status in 100...599"
+        )
         self.data = data
         self.statusCode = statusCode
-        self.headers = Self.canonicalized(headers)
+        self.normalizedHeaders = Self.canonicalized(headers)
     }
 
     /// Returns a response header without requiring callers or transports to agree on
-    /// capitalization (for example, `Retry-After` versus `retry-after`). If a caller
-    /// mutates ``headers`` to contain case-variant duplicates, the lexicographically
-    /// first field name wins, matching initialization's deterministic precedence.
+    /// capitalization (for example, `Retry-After` versus `retry-after`).
     public func value(forHTTPHeaderField field: String) -> String? {
-        headers
-            .filter { $0.key.compare(field, options: .caseInsensitive) == .orderedSame }
-            .sorted { $0.key.utf8.lexicographicallyPrecedes($1.key.utf8) }
-            .first?.value
+        // Storage is already lowercase; keep a case-insensitive fallback for safety.
+        if let exact = normalizedHeaders[field.lowercased()] {
+            return exact
+        }
+        return normalizedHeaders
+            .first { $0.key.compare(field, options: .caseInsensitive) == .orderedSame }?
+            .value
     }
 
     private static func canonicalized(_ headers: [String: String]) -> [String: String] {

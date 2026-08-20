@@ -71,6 +71,41 @@ struct URLSessionTransportTests {
 
         #expect(error?.statusCode == status)
         #expect(error?.limit == 8)
+        #expect(error?.phase == .body)
+        #expect(error?.observedByteCount == 8)
+    }
+
+    @Test
+    func `a mismatched Content-Length for a file body is rejected before upload`() async throws {
+        let body = Data(repeating: 0x11, count: 32)
+        let bodyFileURL = FileManager.default.temporaryDirectory
+            .appending(path: "PaginatedRESTClient-\(UUID().uuidString).body")
+        try body.write(to: bodyFileURL)
+        defer { try? FileManager.default.removeItem(at: bodyFileURL) }
+
+        let request = RESTRequest(
+            url: URL(string: "https://example.test/upload")!,
+            method: "POST",
+            headers: ["Content-Length": "999"],
+            bodyFileURL: bodyFileURL
+        )
+
+        await #expect(throws: RESTRequestBodyError.contentLengthMismatch(expected: 32, declared: "999")) {
+            _ = try await URLSessionTransport().response(for: request)
+        }
+    }
+
+    @Test
+    func `RESTResponse header assignment re-canonicalizes names`() {
+        var response = RESTResponse(
+            data: Data(),
+            statusCode: 200,
+            headers: ["X-Test": "one", "x-test": "two"]
+        )
+        #expect(response.headers == ["x-test": "one"])
+        response.headers = ["Retry-After": "1", "retry-after": "2"]
+        #expect(response.headers == ["retry-after": "1"])
+        #expect(response.value(forHTTPHeaderField: "RETRY-AFTER") == "1")
     }
 
     @Test
@@ -98,6 +133,34 @@ struct URLSessionTransportTests {
             return
         }
         #expect(detail.contains("HTTP 200 response exceeded the 8-byte limit"))
+    }
+
+    @Test
+    func `the client maps an error-status overflow through its http error policy`() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [ResponseLimitURLProtocol.self]
+        let client = PaginatedRESTClient(
+            apiKey: "key",
+            baseURL: URL(string: "https://example.test")!,
+            transport: URLSessionTransport(
+                session: URLSession(configuration: configuration),
+                errorResponseLimit: 8
+            ),
+            decoderFactory: { JSONDecoder() },
+            encoderFactory: { JSONEncoder() },
+            errors: ResponseLimitErrors()
+        )
+
+        let error = await #expect(throws: ResponseLimitFailure.self) {
+            _ = try await client.fetch(ResponseLimitValue.self, path: "/500")
+        }
+
+        guard case let .http(status, body) = error else {
+            Issue.record("Expected a mapped HTTP failure")
+            return
+        }
+        #expect(status == 500)
+        #expect(body.contains("exceeded the 8-byte limit"))
     }
 
     #if os(Linux)
@@ -186,12 +249,13 @@ private final nonisolated class FileBodyURLProtocol: URLProtocol {
 
 private enum ResponseLimitFailure: Error {
     case decode(String)
+    case http(Int, String)
     case unexpected
 }
 
 private struct ResponseLimitErrors: RESTTransportErrorMapping {
     nonisolated func missingAPIKey() -> any Error { ResponseLimitFailure.unexpected }
-    nonisolated func http(status _: Int, body _: String) -> any Error { ResponseLimitFailure.unexpected }
+    nonisolated func http(status: Int, body: String) -> any Error { ResponseLimitFailure.http(status, body) }
     nonisolated func decode(_ detail: String) -> any Error { ResponseLimitFailure.decode(detail) }
     nonisolated func network(_: URLError) -> any Error { ResponseLimitFailure.unexpected }
     nonisolated func isTransient(_: any Error) -> Bool { false }

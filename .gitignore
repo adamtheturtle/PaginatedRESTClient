@@ -61,5 +61,6 @@ fastlane/Preview.html
 fastlane/screenshots/**/*.png
 fastlane/test_output
 
-# Vale styles downloaded by ``vale sync``
-styles/
+# Legacy path from when Vale styles were downloaded by ``vale sync``.
+# Styles are now vendored under ``vale/styles`` (not ignored).
+/styles/
