@@ -52,3 +52,12 @@ API breakage: constructor RESTResponse.init(data:statusCode:headerValues:url:) h
 API breakage: constructor RESTResponse.init(data:statusCode:headers:url:) has been added
 API breakage: func URLSessionTransport.responseDiscardingSuccessBody(for:) has been added
 API breakage: protocol PaginatedRESTPageStream has been added
+/private/tmp/prc-remaining/Sources/PaginatedRESTClient/PaginatedRESTClient.swift:73:29: warning: API breakage: func PagedResponse.identity(of:) has return type change from Swift.AnyHashable? to PaginatedRESTClient.RESTItemIdentity? [#api-digester-breaking-change]
+/private/tmp/prc-remaining/Sources/PaginatedRESTClient/PaginatedRESTClient.swift:81:29: warning: API breakage: func PagedResponse.identity(of:) has return type change from Swift.AnyHashable? to PaginatedRESTClient.RESTItemIdentity? [#api-digester-breaking-change]
+/private/tmp/prc-remaining/Sources/PaginatedRESTClient/RESTTransport.swift:32:16: warning: API breakage: var RESTRequest.headers is now with nonisolated [#api-digester-breaking-change]
+API breakage: func PagedResponse.identity(of:) has return type change from Swift.AnyHashable? to PaginatedRESTClient.RESTItemIdentity?
+API breakage: var RESTRequest.headers is now with nonisolated
+API breakage: var RESTRequest.headerFields has been added as a stored property
+API breakage: constructor RESTRequest.init(url:method:headerFields:body:bodyFileURL:) has been added
+API breakage: var PaginatedRESTClient.maxPaginationHTTPAttempts has been added as a stored property
+API breakage: struct RESTItemIdentity has been added

@@ -16,7 +16,7 @@ private nonisolated struct ItemsPage: PagedResponse {
 
     var pageItems: [Item] { items }
 
-    nonisolated static func identity(of item: Item) -> AnyHashable? { item.id }
+    nonisolated static func identity(of item: Item) -> RESTItemIdentity? { RESTItemIdentity(item.id) }
 
     enum CodingKeys: String, CodingKey {
         case items

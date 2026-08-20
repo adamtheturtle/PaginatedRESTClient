@@ -116,8 +116,8 @@ private nonisolated struct ThingsPage: PagedResponse {
         2
     }
 
-    nonisolated static func identity(of item: Thing) -> AnyHashable? {
-        item.id
+    nonisolated static func identity(of item: Thing) -> RESTItemIdentity? {
+        RESTItemIdentity(item.id)
     }
 
     enum CodingKeys: String, CodingKey { case things; case nextPage = "next_page"; case total }
@@ -137,8 +137,8 @@ private nonisolated struct TenPerPage: PagedResponse {
         10
     }
 
-    nonisolated static func identity(of item: Thing) -> AnyHashable? {
-        item.id
+    nonisolated static func identity(of item: Thing) -> RESTItemIdentity? {
+        RESTItemIdentity(item.id)
     }
 
     enum CodingKeys: String, CodingKey { case things; case nextPage = "next_page"; case total }
@@ -151,7 +151,7 @@ private nonisolated struct HugePageSize: PagedResponse {
     var pageItems: [Thing] { things }
 
     nonisolated static var pageSize: Int { .max }
-    nonisolated static func identity(of item: Thing) -> AnyHashable? { item.id }
+    nonisolated static func identity(of item: Thing) -> RESTItemIdentity? { RESTItemIdentity(item.id) }
 
     enum CodingKeys: String, CodingKey { case things; case nextPage = "next_page"; case total }
 }
@@ -166,8 +166,8 @@ private nonisolated struct PartialIdentityPage: PagedResponse {
 
     nonisolated static var pageSize: Int { 10 }
 
-    nonisolated static func identity(of item: Thing) -> AnyHashable? {
-        item.id == 11 ? nil : item.id
+    nonisolated static func identity(of item: Thing) -> RESTItemIdentity? {
+        item.id == 11 ? nil : RESTItemIdentity(item.id)
     }
 
     enum CodingKeys: String, CodingKey { case things; case nextPage = "next_page"; case total }
@@ -1585,8 +1585,8 @@ private nonisolated struct MixedIdentityPage: PagedResponse {
 
     nonisolated static var pageSize: Int { 10 }
 
-    nonisolated static func identity(of item: Thing) -> AnyHashable? {
-        item.id < 0 ? nil : item.id
+    nonisolated static func identity(of item: Thing) -> RESTItemIdentity? {
+        item.id < 0 ? nil : RESTItemIdentity(item.id)
     }
 
     enum CodingKeys: String, CodingKey { case things; case nextPage = "next_page"; case total }
@@ -1598,7 +1598,7 @@ private nonisolated struct ZeroPageSize: PagedResponse {
     let total: Int?
     var pageItems: [Thing] { things }
     nonisolated static var pageSize: Int { 0 }
-    nonisolated static func identity(of item: Thing) -> AnyHashable? { item.id }
+    nonisolated static func identity(of item: Thing) -> RESTItemIdentity? { RESTItemIdentity(item.id) }
     enum CodingKeys: String, CodingKey { case things; case nextPage = "next_page"; case total }
 }
 
