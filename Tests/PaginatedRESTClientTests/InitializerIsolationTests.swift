@@ -17,8 +17,8 @@ private struct IsolationProbeErrors: RESTTransportErrorMapping {
 
 /// Downstream-style compile probe: constructing from a nonisolated function must compile
 /// under the module's default MainActor isolation (issues #64 and #65).
-private nonisolated func makePaginatedRESTClientFromNonisolatedContext() -> PaginatedRESTClient {
-    PaginatedRESTClient(
+private nonisolated func makePaginatedRESTClientFromNonisolatedContext() throws -> PaginatedRESTClient {
+    try PaginatedRESTClient(
         apiKey: "key",
         baseURL: URL(string: "https://example.test")!,
         decoderFactory: { JSONDecoder() },
@@ -50,8 +50,8 @@ private nonisolated func makeRESTValuesFromNonisolatedContext() -> IsolationProb
 @Suite("Initializer isolation")
 struct InitializerIsolationTests {
     @Test
-    func `paginatedRESTClient can be constructed from a nonisolated context`() {
-        _ = makePaginatedRESTClientFromNonisolatedContext()
+    func `paginatedRESTClient can be constructed from a nonisolated context`() throws {
+        _ = try makePaginatedRESTClientFromNonisolatedContext()
     }
 
     @Test

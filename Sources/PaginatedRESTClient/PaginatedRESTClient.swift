@@ -149,6 +149,12 @@ private nonisolated struct HTTPAttemptFailure: Error {
     let mappedError: any Error
 }
 
+/// Preserves overflow identity until retry logic can reject another download of the
+/// same oversized response, while retaining the error that public APIs expose.
+private nonisolated struct ResponseOverflowFailure: Error {
+    let mappedError: any Error
+}
+
 // MARK: - Client
 
 /// The reusable paginator. Carries only immutable, Sendable configuration and drives
@@ -238,10 +244,10 @@ public struct PaginatedRESTClient {
         maxParallelPages: Int = Self.defaultMaxParallelPages,
         maxRetryDelay: TimeInterval = Self.defaultMaxRetryDelay,
         maxAttempts: Int = Self.defaultMaxAttempts
-    ) {
+    ) throws {
         self.init(
             apiKey: apiKey,
-            baseURL: baseURL,
+            baseURL: try Self.validatedBaseURL(baseURL, errors: errors),
             transport: transport,
             decoderFactory: decoderFactory,
             encoderFactory: encoderFactory,
@@ -253,6 +259,24 @@ public struct PaginatedRESTClient {
             maxRetryDelay: maxRetryDelay,
             maxAttempts: maxAttempts
         )
+    }
+
+    /// Absolute HTTP(S) origins only: host present, no userinfo.
+    nonisolated static func validatedBaseURL(
+        _ url: URL,
+        errors: any RESTTransportErrorMapping
+    ) throws -> URL {
+        let stripped = strippingFragment(url)
+        guard let components = URLComponents(url: stripped, resolvingAgainstBaseURL: false),
+              let scheme = components.scheme?.lowercased(),
+              ["http", "https"].contains(scheme),
+              components.host != nil,
+              components.user == nil,
+              components.password == nil
+        else {
+            throw errors.invalidRequest("Invalid base URL")
+        }
+        return stripped
     }
 
     nonisolated init(
@@ -462,8 +486,12 @@ public struct PaginatedRESTClient {
                 try await retryRuntime.sleep(retryBackoffDelay(retryNumber: attempt))
             } catch is CancellationError {
                 throw CancellationError()
+            } catch let overflow as ResponseOverflowFailure {
+                throw overflow.mappedError
             } catch let bodyError as RESTRequestBodyError {
                 throw mappedBodyError(bodyError)
+            } catch let requestError as RESTRequestError {
+                throw mappedRequestError(requestError)
             } catch {
                 attempt += 1
                 guard attempt < retryAttempts, errors.isTransient(error) else { throw error }
@@ -543,6 +571,10 @@ public struct PaginatedRESTClient {
             throw failure.mappedError
         } catch let bodyError as RESTRequestBodyError {
             throw mappedBodyError(bodyError)
+        } catch let requestError as RESTRequestError {
+            throw mappedRequestError(requestError)
+        } catch let overflow as ResponseOverflowFailure {
+            throw overflow.mappedError
         }
     }
 
@@ -550,7 +582,12 @@ public struct PaginatedRESTClient {
         _ type: T.Type,
         request: RESTRequest
     ) async throws -> T {
-        let response = try await transportResponse(for: request)
+        let response: RESTResponse
+        do {
+            response = try await transportResponse(for: request)
+        } catch let overflow as RESTResponseTooLargeError {
+            throw ResponseOverflowFailure(mappedError: mappedOverflow(overflow))
+        }
         guard (200 ..< 300).contains(response.statusCode) else {
             throw HTTPAttemptFailure(
                 response: response,
@@ -590,8 +627,6 @@ public struct PaginatedRESTClient {
             return try await transport.response(for: request)
         } catch is CancellationError {
             throw CancellationError()
-        } catch let overflow as RESTResponseTooLargeError {
-            throw mappedOverflow(overflow)
         } catch let urlError as URLError {
             try Task.checkCancellation()
             // Surface transport failures (offline, timeout, unreachable) as a typed,
@@ -644,6 +679,19 @@ public struct PaginatedRESTClient {
         errors.invalidRequest(Self.describeBodyError(error))
     }
 
+    private nonisolated func mappedRequestError(_ error: RESTRequestError) -> any Error {
+        switch error {
+        case let .invalidHTTPMethod(method):
+            errors.invalidRequest("Invalid HTTP method \(method)")
+        case let .unsupportedURL(url):
+            errors.invalidRequest("Unsupported URL \(url.absoluteString)")
+        case .invalidHeaderField:
+            errors.invalidRequest("Request contains an invalid HTTP header field")
+        case .unsupportedBackgroundSession:
+            errors.invalidRequest("Background URLSession configurations are not supported")
+        }
+    }
+
     private nonisolated func makeSendRequest(
         method: String,
         path: String,
@@ -688,25 +736,42 @@ public struct PaginatedRESTClient {
     /// the main actor. Builds a fresh decoder per call - `JSONDecoder` isn't safe to share
     /// across threads. `DecodingError`s propagate so `perform` can map them as before.
     ///
-    /// A structured child task (not `Task.detached`) so it inherits cancellation: when a
-    /// streaming load is torn down, queued decodes bail at the check below instead of
-    /// parsing into a result that's about to be discarded. This function is `nonisolated`,
-    /// so the task still runs off the main actor.
+    /// A structured child task inherits cancellation, so a stream teardown cancels queued
+    /// decode work instead of letting it parse a result that will be discarded.
     private nonisolated func decodeInBackground<T: Decodable & Sendable>(
         _: T.Type,
         from data: Data
     ) async throws -> T {
         let make = decoderFactory
-        return try await Task(priority: .userInitiated) {
-            try Task.checkCancellation()
-            return try make().decode(T.self, from: data)
-        }.value
+        return try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask(priority: .userInitiated) {
+                try Task.checkCancellation()
+                return try make().decode(T.self, from: data)
+            }
+            guard let decoded = try await group.next() else {
+                throw CancellationError()
+            }
+            return decoded
+        }
     }
 }
 
 extension PaginatedRESTClient {
-    /// Parses RFC delay-seconds and all three HTTP-date forms. A date in the past is a
-    /// valid instruction to retry immediately; malformed and negative values fall back.
+    private nonisolated struct HTTPDateToken {
+        let day: Int
+        let month: Int
+        let year: Int
+    }
+
+    private nonisolated struct HTTPTime {
+        let hour: Int
+        let minute: Int
+        let second: Int
+    }
+
+    /// Parses RFC delay-seconds and the three HTTP-date productions. Dates must use the
+    /// exact HTTP-date grammar (including GMT); malformed and negative values fall back.
+    /// RFC850 two-digit years follow the HTTP >50-years-in-the-future rule.
     nonisolated static func retryAfterDelay(_ value: String?, relativeTo now: Date) -> TimeInterval? {
         guard let value else { return nil }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -714,24 +779,164 @@ extension PaginatedRESTClient {
            trimmed.allSatisfy(\.isNumber), let seconds = TimeInterval(trimmed), seconds.isFinite {
             return seconds
         }
+        guard let date = parseHTTPDate(trimmed, relativeTo: now) else { return nil }
+        return max(0, date.timeIntervalSince(now))
+    }
 
-        let formats = [
-            "EEE',' dd MMM yyyy HH':'mm':'ss zzz",
-            "EEEE',' dd-MMM-yy HH':'mm':'ss zzz",
-            "EEE MMM d HH':'mm':'ss yyyy"
+    /// IMF-fixdate, RFC850, and asctime forms from RFC 9110.
+    nonisolated static func parseHTTPDate(_ value: String, relativeTo now: Date) -> Date? {
+        if let date = parseIMFFixDate(value) { return date }
+        if let date = parseRFC850Date(value, relativeTo: now) { return date }
+        return parseAsctimeDate(value)
+    }
+
+    private nonisolated static var httpMonths: [String: Int] {
+        [
+            "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+            "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12
         ]
-        for format in formats {
-            let formatter = DateFormatter()
-            formatter.locale = Locale(identifier: "en_US_POSIX")
-            formatter.calendar = Calendar(identifier: .gregorian)
-            formatter.timeZone = TimeZone(secondsFromGMT: 0)
-            formatter.dateFormat = format
-            formatter.isLenient = false
-            if let date = formatter.date(from: trimmed) {
-                return max(0, date.timeIntervalSince(now))
-            }
+    }
+
+    private nonisolated static var httpWeekdays: Set<String> {
+        ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    }
+
+    private nonisolated static var httpWeekdaysLong: Set<String> {
+        ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+    }
+
+    private nonisolated static func parseIMFFixDate(_ value: String) -> Date? {
+        // Sun, 06 Nov 1994 08:49:37 GMT
+        let parts = value.split(separator: " ", omittingEmptySubsequences: false).map(String.init)
+        guard parts.count == 6,
+              parts[0].hasSuffix(","),
+              httpWeekdays.contains(String(parts[0].dropLast())),
+              parts[1].count == 2, let day = Int(parts[1]), (1 ... 31).contains(day),
+              let month = httpMonths[parts[2]],
+              parts[3].count == 4, let year = Int(parts[3]), year >= 1601,
+              let time = parseHTTPTime(parts[4]),
+              parts[5] == "GMT"
+        else { return nil }
+        return makeGMTDate(
+            year: year, month: month, day: day,
+            hour: time.hour, minute: time.minute, second: time.second
+        ).flatMap { date in
+            matchesWeekday(parts[0].dropLast(), date: date) ? date : nil
         }
-        return nil
+    }
+
+    private nonisolated static func parseRFC850Date(_ value: String, relativeTo now: Date) -> Date? {
+        // Sunday, 06-Nov-94 08:49:37 GMT
+        let parts = value.split(separator: " ", omittingEmptySubsequences: false).map(String.init)
+        guard parts.count == 4,
+              parts[0].hasSuffix(","),
+              httpWeekdaysLong.contains(String(parts[0].dropLast())),
+              let dateParts = parseRFC850DateToken(parts[1]),
+              let time = parseHTTPTime(parts[2]),
+              parts[3] == "GMT"
+        else { return nil }
+        let year = interpretTwoDigitYear(dateParts.year, relativeTo: now)
+        return makeGMTDate(
+            year: year, month: dateParts.month, day: dateParts.day,
+            hour: time.hour, minute: time.minute, second: time.second
+        ).flatMap { date in
+            matchesWeekdayLong(parts[0].dropLast(), date: date) ? date : nil
+        }
+    }
+
+    private nonisolated static func parseAsctimeDate(_ value: String) -> Date? {
+        // Sun Nov  6 08:49:37 1994
+        let parts = value.split(whereSeparator: { $0 == " " }).map(String.init)
+        guard parts.count == 5,
+              httpWeekdays.contains(parts[0]),
+              let month = httpMonths[parts[1]],
+              let day = Int(parts[2]), (1 ... 31).contains(day),
+              let time = parseHTTPTime(parts[3]),
+              parts[4].count == 4, let year = Int(parts[4]), year >= 1601
+        else { return nil }
+        return makeGMTDate(
+            year: year, month: month, day: day,
+            hour: time.hour, minute: time.minute, second: time.second
+        ).flatMap { date in
+            matchesWeekday(Substring(parts[0]), date: date) ? date : nil
+        }
+    }
+
+    private nonisolated static func parseRFC850DateToken(
+        _ token: String
+    ) -> HTTPDateToken? {
+        let parts = token.split(separator: "-", omittingEmptySubsequences: false).map(String.init)
+        guard parts.count == 3,
+              parts[0].count == 2, let day = Int(parts[0]), (1 ... 31).contains(day),
+              let month = httpMonths[parts[1]],
+              parts[2].count == 2, let year = Int(parts[2]), (0 ... 99).contains(year)
+        else { return nil }
+        return HTTPDateToken(day: day, month: month, year: year)
+    }
+
+    private nonisolated static func parseHTTPTime(_ value: String) -> HTTPTime? {
+        let parts = value.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+        guard parts.count == 3,
+              parts[0].count == 2, let hour = Int(parts[0]), (0 ... 23).contains(hour),
+              parts[1].count == 2, let minute = Int(parts[1]), (0 ... 59).contains(minute),
+              parts[2].count == 2, let second = Int(parts[2]), (0 ... 60).contains(second)
+        else { return nil }
+        return HTTPTime(hour: hour, minute: minute, second: second)
+    }
+
+    /// HTTP rfc850-date: a year more than 50 years ahead becomes the most recent past match.
+    nonisolated static func interpretTwoDigitYear(_ year: Int, relativeTo now: Date) -> Int {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let currentYear = calendar.component(.year, from: now)
+        var fullYear = (currentYear / 100) * 100 + year
+        if fullYear > currentYear + 50 {
+            fullYear -= 100
+        }
+        return fullYear
+    }
+
+    private nonisolated static func makeGMTDate(
+        year: Int, month: Int, day: Int, hour: Int, minute: Int, second: Int
+    ) -> Date? {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        var components = DateComponents()
+        components.year = year
+        components.month = month
+        components.day = day
+        components.hour = hour
+        components.minute = minute
+        components.second = second
+        guard let date = calendar.date(from: components) else { return nil }
+        let echoed = calendar.dateComponents(
+            [.year, .month, .day, .hour, .minute, .second],
+            from: date
+        )
+        guard echoed.year == year, echoed.month == month, echoed.day == day,
+              echoed.hour == hour, echoed.minute == minute, echoed.second == second
+        else { return nil }
+        return date
+    }
+
+    private nonisolated static func matchesWeekday(_ token: Substring, date: Date) -> Bool {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let symbols = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+        let weekday = calendar.component(.weekday, from: date)
+        guard (1 ... 7).contains(weekday) else { return false }
+        return symbols[weekday - 1] == token
+    }
+
+    private nonisolated static func matchesWeekdayLong(_ token: Substring, date: Date) -> Bool {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let symbols = [
+            "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"
+        ]
+        let weekday = calendar.component(.weekday, from: date)
+        guard (1 ... 7).contains(weekday) else { return false }
+        return symbols[weekday - 1] == token
     }
 
     /// Positive jitter above a conservative one-second exponential base, capped at
@@ -866,7 +1071,9 @@ extension PaginatedRESTClient {
 
     private nonisolated func retryBackoffDelay(retryNumber: Int) -> TimeInterval {
         let exponent = Double(min(max(retryNumber - 1, 0), 10))
-        return min(maxRetryDelay, 0.3 * pow(2, exponent))
+        let base = 0.3 * pow(2, exponent)
+        let factor = 1 + (0.25 * min(max(retryRuntime.jitter(), 0), 1))
+        return min(maxRetryDelay, base * factor)
     }
 }
 
@@ -874,6 +1081,8 @@ public extension PaginatedRESTClient {
     /// Builds an authenticated request for a path on the configured origin. Callers can
     /// supply raw or file-backed bodies without exposing the bearer credential to another
     /// origin. The generated authorization header always replaces a caller-supplied one.
+    /// Builds an authenticated request for the configured origin. Validates origin/userinfo
+    /// and body-source exclusivity before returning a transport-ready ``RESTRequest``.
     nonisolated func authorizedRequest(
         method: String,
         path: String,
@@ -967,7 +1176,12 @@ public extension PaginatedRESTClient {
     /// whether its body is empty (including 204) or contains optional server metadata.
     nonisolated func performNoContent(request: RESTRequest) async throws {
         do {
-            let response = try await transportResponse(for: request)
+            let response: RESTResponse
+            do {
+                response = try await transportResponse(for: request)
+            } catch let overflow as RESTResponseTooLargeError {
+                throw ResponseOverflowFailure(mappedError: mappedOverflow(overflow))
+            }
             guard (200 ..< 300).contains(response.statusCode) else {
                 throw HTTPAttemptFailure(
                     response: response,
@@ -982,6 +1196,82 @@ public extension PaginatedRESTClient {
             throw failure.mappedError
         } catch let bodyError as RESTRequestBodyError {
             throw mappedBodyError(bodyError)
+        } catch let requestError as RESTRequestError {
+            throw mappedRequestError(requestError)
+        } catch let overflow as ResponseOverflowFailure {
+            throw overflow.mappedError
+        }
+    }
+
+    /// Retries an idempotent no-content request using the same policy as
+    /// ``performWithRetry(_:request:maxAttempts:)``.
+    nonisolated func performNoContentWithRetry(
+        request: RESTRequest,
+        maxAttempts: Int? = nil
+    ) async throws {
+        let attempts = maxAttempts ?? self.maxAttempts
+        guard attempts > 0 else { throw errors.decode("maxAttempts must be positive") }
+        guard Self.methodIsIdempotent(request.method) else {
+            try await performNoContent(request: request)
+            return
+        }
+
+        let retryAttempts = request.bodyFileURL == nil ? attempts : 1
+        var attempt = 0
+        while true {
+            do {
+                let response: RESTResponse
+                do {
+                    response = try await transportResponse(for: request)
+                } catch let overflow as RESTResponseTooLargeError {
+                    throw ResponseOverflowFailure(mappedError: mappedOverflow(overflow))
+                }
+                guard (200 ..< 300).contains(response.statusCode) else {
+                    throw HTTPAttemptFailure(
+                        response: response,
+                        mappedError: errors.http(
+                            status: response.statusCode,
+                            body: Self.boundedErrorBody(response.data)
+                        )
+                    )
+                }
+                return
+            } catch let failure as HTTPAttemptFailure {
+                attempt += 1
+                guard attempt < retryAttempts, errors.isTransient(failure.mappedError) else {
+                    if failure.response.statusCode == 429 { observeRateLimitCooldown(from: failure.response) }
+                    throw failure.mappedError
+                }
+                if failure.response.statusCode == 429 {
+                    let now = retryRuntime.now()
+                    let delay = min(maxRetryDelay, Self.retryAfterDelay(
+                        failure.response.value(forHTTPHeaderField: "Retry-After"),
+                        relativeTo: now
+                    ) ?? Self.rateLimitFallbackDelay(retryNumber: attempt, jitter: retryRuntime.jitter()))
+                    rateLimitCooldown.extend(until: now.addingTimeInterval(delay))
+                    try await waitForRateLimitCooldown()
+                } else if Self.honorsRetryAfter(statusCode: failure.response.statusCode),
+                          let delay = Self.retryAfterDelay(
+                              failure.response.value(forHTTPHeaderField: "Retry-After"),
+                              relativeTo: retryRuntime.now()
+                          ) {
+                    try await retryRuntime.sleep(min(maxRetryDelay, delay))
+                } else {
+                    try await retryRuntime.sleep(retryBackoffDelay(retryNumber: attempt))
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let overflow as ResponseOverflowFailure {
+                throw overflow.mappedError
+            } catch let bodyError as RESTRequestBodyError {
+                throw mappedBodyError(bodyError)
+            } catch let requestError as RESTRequestError {
+                throw mappedRequestError(requestError)
+            } catch {
+                attempt += 1
+                guard attempt < retryAttempts, errors.isTransient(error) else { throw error }
+                try await retryRuntime.sleep(retryBackoffDelay(retryNumber: attempt))
+            }
         }
     }
 }
@@ -1333,14 +1623,14 @@ nonisolated func walkNextPages<W: PagedResponse>(
         }
 
         let page = try await performWithRetry(W.self, request: try authorizedGET(current))
-        Self.appendNew(
+        let added = Self.appendNew(
             page.pageItems,
             to: &items,
             seen: &seen,
             identity: W.identity(of:),
             deduplicate: deduplicate
         )
-        emit(items)
+        if added > 0 { emit(items) }
         pagesFetched += 1
         guard let next = page.nextPage else { break }
 
@@ -1363,8 +1653,9 @@ nonisolated func walkNextPages<W: PagedResponse>(
 /// the response that supplied them (RFC 3986), while every absolute result must remain
 /// on the configured HTTP(S) origin.
 nonisolated func validatedNextPageURL(_ value: String, relativeTo pageURL: URL) throws -> URL? {
-    guard !value.isEmpty else { return nil }
-    guard let resolved = URL(string: value, relativeTo: pageURL)?.absoluteURL else {
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+    guard let resolved = URL(string: trimmed, relativeTo: pageURL)?.absoluteURL else {
         throw errors.invalidRequest("Invalid pagination next_page")
     }
 

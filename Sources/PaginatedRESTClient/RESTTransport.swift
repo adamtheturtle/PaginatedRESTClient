@@ -52,6 +52,62 @@ public nonisolated struct RESTRequest: Sendable {
         guard body == nil || bodyFileURL == nil else {
             throw RESTRequestBodyError.multipleSources
         }
+        guard Self.isValidHTTPMethod(method) else {
+            throw RESTRequestError.invalidHTTPMethod(method)
+        }
+        guard Self.isHTTPURL(url) else {
+            throw RESTRequestError.unsupportedURL(url)
+        }
+        guard headers.allSatisfy({ Self.isValidHeaderName($0.key) && Self.isValidHeaderValue($0.value) }) else {
+            throw RESTRequestError.invalidHeaderField
+        }
+    }
+
+    /// RFC 9110 method tokens: nonempty ASCII `tchar` sequences.
+    nonisolated static func isValidHTTPMethod(_ method: String) -> Bool {
+        !method.isEmpty && method.utf8.allSatisfy(isHTTPTchar)
+    }
+
+    /// HTTP transports require an absolute HTTP(S) URL and never accept userinfo.
+    nonisolated static func isHTTPURL(_ url: URL) -> Bool {
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let scheme = components.scheme?.lowercased(),
+              ["http", "https"].contains(scheme),
+              components.host != nil,
+              components.user == nil,
+              components.password == nil
+        else {
+            return false
+        }
+        return true
+    }
+
+    /// RFC 9110 field names are tokens. Values may contain horizontal tabs, but not
+    /// other control bytes or line breaks that could create a second field.
+    nonisolated static func isValidHeaderName(_ value: String) -> Bool {
+        !value.isEmpty && value.utf8.allSatisfy(isHTTPTchar)
+    }
+
+    nonisolated static func isValidHeaderValue(_ value: String) -> Bool {
+        value.utf8.allSatisfy { byte in
+            byte == 0x09 || (0x20 ... 0x7E).contains(byte) || byte >= 0x80
+        }
+    }
+
+    private nonisolated static func isHTTPTchar(_ byte: UInt8) -> Bool {
+        switch byte {
+        case UInt8(ascii: "0") ... UInt8(ascii: "9"),
+             UInt8(ascii: "A") ... UInt8(ascii: "Z"),
+             UInt8(ascii: "a") ... UInt8(ascii: "z"):
+            true
+        case UInt8(ascii: "!"), UInt8(ascii: "#"), UInt8(ascii: "$"), UInt8(ascii: "%"),
+             UInt8(ascii: "&"), UInt8(ascii: "'"), UInt8(ascii: "*"), UInt8(ascii: "+"),
+             UInt8(ascii: "-"), UInt8(ascii: "."), UInt8(ascii: "^"), UInt8(ascii: "_"),
+             UInt8(ascii: "`"), UInt8(ascii: "|"), UInt8(ascii: "~"):
+            true
+        default:
+            false
+        }
     }
 }
 
@@ -65,6 +121,18 @@ public nonisolated enum RESTRequestBodyError: Error, Equatable, Sendable {
     case unreadableBodyFile(URL)
     /// A caller-supplied `Content-Length` did not match the opened body file's size.
     case contentLengthMismatch(expected: Int, declared: String)
+}
+
+/// A request failed backend-neutral validation before any bytes were sent.
+public nonisolated enum RESTRequestError: Error, Equatable, Sendable {
+    /// The HTTP method is empty or contains characters outside the RFC 9110 token grammar.
+    case invalidHTTPMethod(String)
+    /// The URL is not an absolute HTTP(S) URL suitable for a REST response.
+    case unsupportedURL(URL)
+    /// A header name or value cannot be represented safely as an HTTP field.
+    case invalidHeaderField
+    /// The session configuration cannot run the package's data-task transfer path.
+    case unsupportedBackgroundSession
 }
 
 /// The raw result of one HTTP request. Header names are matched case-insensitively by

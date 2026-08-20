@@ -597,7 +597,7 @@ struct PaginatedRESTClientTests {
 
     @Test
     func `custom decoding failures use the configured mapping`() async throws {
-        let client = PaginatedRESTClient(
+        let client = try PaginatedRESTClient(
             apiKey: "test-key",
             baseURL: try #require(URL(string: "https://example.test")),
             transport: FixedResponseTransport(data: Data("{}".utf8), status: 200),
@@ -619,7 +619,7 @@ struct PaginatedRESTClientTests {
     @Test
     func `mapped HTTP bodies are bounded sanitized and marked when truncated`() async throws {
         let body = Data([0, 0xFF]) + Data(repeating: 97, count: 20_000)
-        let client = PaginatedRESTClient(
+        let client = try PaginatedRESTClient(
             apiKey: "test-key",
             baseURL: try #require(URL(string: "https://example.test")),
             transport: FixedResponseTransport(data: body, status: 500),
@@ -720,7 +720,7 @@ struct PaginatedRESTClientTests {
 
     @Test
     func `an empty API key fails before any request`() async throws {
-        let client = PaginatedRESTClient(
+        let client = try PaginatedRESTClient(
             apiKey: "",
             baseURL: try #require(URL(string: "https://example.test")),
             transport: StubTransport(),
@@ -738,7 +738,7 @@ struct PaginatedRESTClientTests {
 extension PaginatedRESTClientTests {
     @Test(arguments: ["   ", "\n\t", "key\nsecond", "key\u{7F}"])
     func `invalid bearer keys cannot build authorized requests`(apiKey: String) async throws {
-        let client = PaginatedRESTClient(
+        let client = try PaginatedRESTClient(
             apiKey: apiKey,
             baseURL: try #require(URL(string: "https://example.test")),
             transport: StubTransport(),
@@ -754,7 +754,7 @@ extension PaginatedRESTClientTests {
 
     @Test
     func `bearer keys are trimmed before use`() throws {
-        let client = PaginatedRESTClient(
+        let client = try PaginatedRESTClient(
             apiKey: "  test-key\n",
             baseURL: try #require(URL(string: "https://example.test")),
             decoderFactory: { JSONDecoder() },
@@ -1450,7 +1450,7 @@ struct PaginationIssueRegressionTests {
     @Test
     func `a nil next page on the first response stops parallel speculation`() async throws {
         let log = RequestLog()
-        let transport = ScriptedTransport(
+        _ = ScriptedTransport(
             pages: [Array(1 ... 10), Array(11 ... 20)],
             total: 20,
             outOfRange: .notFound,
@@ -1838,7 +1838,7 @@ struct ClientIssueRegressionTests {
 
     @Test
     func `cancellationError from a transport is not classified as transient`() async throws {
-        let client = PaginatedRESTClient(
+        let client = try PaginatedRESTClient(
             apiKey: "key",
             baseURL: URL(string: "https://example.test")!,
             transport: CancellationProbeTransport(),
@@ -1862,7 +1862,7 @@ struct ClientIssueRegressionTests {
         }
         let sink = LogSink()
         let transport = RetryOnceTransport(retryAfter: nil, status: 500)
-        let client = PaginatedRESTClient(
+        let client = try PaginatedRESTClient(
             apiKey: "key",
             baseURL: URL(string: "https://example.test")!,
             transport: transport,

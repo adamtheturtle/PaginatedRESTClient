@@ -55,7 +55,7 @@ struct READMEQuickStartTests {
     @Test
     func `the README quick start constructs and fetches`() async throws {
         let token = "readme-token"
-        let client = PaginatedRESTClient(
+        let client = try PaginatedRESTClient(
             apiKey: token,
             baseURL: URL(string: "https://api.example.com")!,
             transport: READMEQuickStartTransport(),

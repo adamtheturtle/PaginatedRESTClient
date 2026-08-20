@@ -36,12 +36,26 @@ public struct URLSessionTransport: RESTTransport {
         self.errorResponseLimit = max(0, errorResponseLimit)
     }
 
+    /// Background configurations cannot drive this transport's in-process data-task
+    /// response path. Reject them before a request starts rather than failing after the
+    /// system has accepted the transfer.
+    public nonisolated static func supports(_ session: URLSession) -> Bool {
+        #if os(Linux)
+        true
+        #else
+        !session.configuration.sessionSendsLaunchEvents
+        #endif
+    }
+
     public nonisolated func data(for request: RESTRequest) async throws -> (Data, Int) {
         let response = try await response(for: request)
         return (response.data, response.statusCode)
     }
 
     public nonisolated func response(for request: RESTRequest) async throws -> RESTResponse {
+        guard Self.supports(session) else {
+            throw RESTRequestError.unsupportedBackgroundSession
+        }
         let urlRequest = try Self.urlRequest(from: request)
         #if os(Linux)
         return try await BoundedURLSessionLoader(
