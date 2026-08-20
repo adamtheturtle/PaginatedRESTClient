@@ -72,10 +72,11 @@ public struct URLSessionTransport: RESTTransport {
         let bodyFileURL = request.bodyFileURL
         let failureBox = FileBodyStreamFailureBox()
         let urlRequest = try Self.urlRequest(from: request, bodyStreamFailureBox: failureBox)
-        // Both Apple and Linux use a bounded data-task loader on the *supplied* session so
-        // connection pooling, session identity in delegate callbacks, and invalidation all
-        // match direct URLSession use. Body bytes arrive in `didReceive data` chunks rather
-        // than one AsyncBytes element at a time.
+        // Apple uses a task-specific delegate on the supplied session so pooling and
+        // session identity match direct URLSession use. Linux creates a one-shot
+        // session (FoundationNetworking does not deliver task-specific delegates) from
+        // the caller's configuration. Body bytes arrive in `didReceive data` chunks
+        // rather than one AsyncBytes element at a time.
         do {
             return try await BoundedURLSessionLoader(
                 successResponseLimit: successResponseLimit,
@@ -275,6 +276,10 @@ nonisolated final class FileBodyStreamFailureBox: @unchecked Sendable {
 final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private struct State {
         var continuation: CheckedContinuation<RESTResponse, any Error>?
+        /// Linux-only owned session. swift-corelibs-foundation does not deliver
+        /// task-specific delegates, so Linux creates a one-shot session with `self`
+        /// as the session delegate and finishes it when the transfer ends.
+        var ownedSession: URLSession?
         var task: URLSessionDataTask?
         var response: HTTPURLResponse?
         var data = Data()
@@ -287,6 +292,7 @@ final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecke
     private struct CancellationResources {
         let continuation: CheckedContinuation<RESTResponse, any Error>?
         let task: URLSessionDataTask?
+        let ownedSession: URLSession?
     }
 
     private enum DataReceipt {
@@ -330,25 +336,45 @@ final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecke
         self.forwardingDelegate = forwardingDelegate
     }
 
-    /// Runs `request` on the supplied `session` with this loader as the task delegate.
-    /// The session is never invalidated by the loader; callers own its lifecycle.
+    /// Runs `request` through this loader.
+    ///
+    /// On Apple platforms the loader is attached as a task-specific delegate on the
+    /// supplied session so connection pooling and session identity are preserved.
+    /// On Linux, task-specific delegates are not delivered by FoundationNetworking, so
+    /// the loader creates a one-shot session from the caller's configuration and owns
+    /// that session for the duration of the transfer.
     func load(on session: URLSession, request: URLRequest) async throws -> RESTResponse {
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 let task = lock.withLock { () -> URLSessionDataTask? in
                     guard !state.cancelled else { return nil }
+                    #if os(Linux)
+                    let owned = URLSession(
+                        configuration: session.configuration,
+                        delegate: self,
+                        delegateQueue: session.delegateQueue
+                    )
+                    let task = owned.dataTask(with: request)
+                    state.continuation = continuation
+                    state.ownedSession = owned
+                    state.task = task
+                    return task
+                    #else
                     let task = session.dataTask(with: request)
                     state.continuation = continuation
                     state.task = task
                     return task
+                    #endif
                 }
                 guard let task else {
                     continuation.resume(throwing: CancellationError())
                     return
                 }
+                #if !os(Linux)
                 // Task-specific delegate receives data/redirect callbacks while still using
                 // the caller's session (pooling, identity, and invalidation).
                 task.delegate = self
+                #endif
                 task.resume()
             }
         } onCancel: {
@@ -511,31 +537,37 @@ final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecke
         let resources = lock.withLock { () -> CancellationResources in
             state.cancelled = true
             guard !state.completed else {
-                return CancellationResources(continuation: nil, task: nil)
+                return CancellationResources(continuation: nil, task: nil, ownedSession: nil)
             }
             state.completed = true
             let result = CancellationResources(
                 continuation: state.continuation,
-                task: state.task
+                task: state.task,
+                ownedSession: state.ownedSession
             )
             state.continuation = nil
             state.task = nil
+            state.ownedSession = nil
             return result
         }
         resources.task?.cancel()
+        resources.ownedSession?.invalidateAndCancel()
         resources.continuation?.resume(throwing: CancellationError())
     }
 
     private func complete(_ result: Result<RESTResponse, any Error>) {
-        let continuation = lock.withLock { () -> CheckedContinuation<RESTResponse, any Error>? in
-            guard !state.completed else { return nil }
+        let resources = lock.withLock { () -> (CheckedContinuation<RESTResponse, any Error>?, URLSession?) in
+            guard !state.completed else { return (nil, nil) }
             state.completed = true
-            let continuation = state.continuation
+            let pair = (state.continuation, state.ownedSession)
             state.continuation = nil
             state.task = nil
-            return continuation
+            state.ownedSession = nil
+            return pair
         }
-        continuation?.resume(with: result)
+        // Only Linux owns a per-request session; never invalidate the caller's session.
+        resources.1?.finishTasksAndInvalidate()
+        resources.0?.resume(with: result)
     }
 }
 

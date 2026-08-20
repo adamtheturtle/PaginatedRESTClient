@@ -278,8 +278,14 @@ struct URLSessionTransportTests {
         #expect(delegate.didCompleteTask)
         #expect(delegate.didReceiveResponse)
         #expect(delegate.didReceiveData)
+        #if os(Linux)
+        // Linux owns a one-shot session (no task-specific delegates), so forwarded
+        // callbacks observe that session rather than the caller's identity.
+        #expect(!delegate.callbackSessionIdentities.isEmpty)
+        #else
         #expect(delegate.callbackSessionIdentities.contains(ObjectIdentifier(session)))
         #expect(delegate.callbackSessionIdentities.count == 1)
+        #endif
     }
 
     @Test
