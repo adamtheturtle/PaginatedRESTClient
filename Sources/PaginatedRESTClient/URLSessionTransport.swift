@@ -53,6 +53,19 @@ public struct URLSessionTransport: RESTTransport {
     }
 
     public nonisolated func response(for request: RESTRequest) async throws -> RESTResponse {
+        try await load(request, retainingSuccessBody: true)
+    }
+
+    public nonisolated func responseDiscardingSuccessBody(
+        for request: RESTRequest
+    ) async throws -> RESTResponse {
+        try await load(request, retainingSuccessBody: false)
+    }
+
+    private nonisolated func load(
+        _ request: RESTRequest,
+        retainingSuccessBody: Bool
+    ) async throws -> RESTResponse {
         guard Self.supports(session) else {
             throw RESTRequestError.unsupportedBackgroundSession
         }
@@ -64,6 +77,7 @@ public struct URLSessionTransport: RESTTransport {
             requestURL: urlRequest.url,
             bodyFileURL: request.bodyFileURL,
             requiresSameOrigin: Self.requiresSameOrigin(urlRequest, bodyFileURL: request.bodyFileURL),
+            retainingSuccessBody: retainingSuccessBody,
             forwardingDelegate: session.delegate
         ).load(
             configuration: session.configuration,
@@ -84,9 +98,10 @@ public struct URLSessionTransport: RESTTransport {
             throw URLError(.badServerResponse)
         }
         let limit = (200 ..< 300).contains(http.statusCode) ? successResponseLimit : errorResponseLimit
+        let retainBody = retainingSuccessBody || !(200 ..< 300).contains(http.statusCode)
         // HEAD is explicitly bodyless. Its Content-Length describes the corresponding GET
         // representation, rather than bytes transferred by this response.
-        let declared = request.method == "HEAD" ? nil : (
+        let declared = request.method == "HEAD" || !retainBody ? nil : (
             http.expectedContentLength >= 0 ? http.expectedContentLength : nil
         )
         guard declared.map({ $0 <= Int64(limit) }) ?? true else {
@@ -100,10 +115,11 @@ public struct URLSessionTransport: RESTTransport {
         }
 
         var data = Data()
-        if http.expectedContentLength > 0 {
+        if retainBody, http.expectedContentLength > 0 {
             data.reserveCapacity(Int(http.expectedContentLength))
         }
         for try await byte in bytes {
+            guard retainBody else { continue }
             guard data.count < limit else {
                 throw RESTResponseTooLargeError(
                     statusCode: http.statusCode,
@@ -116,7 +132,7 @@ public struct URLSessionTransport: RESTTransport {
             data.append(byte)
         }
         let headers = Self.responseHeaders(from: http)
-        return RESTResponse(data: data, statusCode: http.statusCode, headers: headers)
+        return RESTResponse(data: data, statusCode: http.statusCode, headers: headers, url: http.url)
         #endif
     }
 
@@ -278,6 +294,7 @@ final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecke
     private let successResponseLimit: Int
     private let errorResponseLimit: Int
     private let redirectDelegate: SameOriginRedirectDelegate
+    private let retainingSuccessBody: Bool
     private let forwardingDelegate: (any URLSessionDelegate)?
 
     init(
@@ -286,6 +303,7 @@ final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecke
         requestURL: URL?,
         bodyFileURL: URL?,
         requiresSameOrigin: Bool = true,
+        retainingSuccessBody: Bool = true,
         forwardingDelegate: (any URLSessionDelegate)?
     ) {
         self.successResponseLimit = successResponseLimit
@@ -296,6 +314,7 @@ final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecke
             requiresSameOrigin: requiresSameOrigin,
             forwardingDelegate: forwardingDelegate
         )
+        self.retainingSuccessBody = retainingSuccessBody
         self.forwardingDelegate = forwardingDelegate
     }
 
@@ -338,7 +357,8 @@ final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecke
             return
         }
         let limit = (200 ..< 300).contains(http.statusCode) ? successResponseLimit : errorResponseLimit
-        let declared = dataTask.originalRequest?.httpMethod == "HEAD" ? nil : (
+        let retainBody = retainingSuccessBody || !(200 ..< 300).contains(http.statusCode)
+        let declared = dataTask.originalRequest?.httpMethod == "HEAD" || !retainBody ? nil : (
             http.expectedContentLength >= 0 ? http.expectedContentLength : nil
         )
         guard declared.map({ $0 <= Int64(limit) }) ?? true else {
@@ -357,7 +377,7 @@ final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecke
             guard !state.completed else { return }
             state.response = http
             state.limit = limit
-            if http.expectedContentLength > 0 {
+            if retainBody, http.expectedContentLength > 0 {
                 state.data.reserveCapacity(Int(http.expectedContentLength))
             }
         }
@@ -371,6 +391,15 @@ final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecke
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        let shouldRetain = retainingSuccessBody || lock.withLock {
+            guard let response = state.response else { return true }
+            return !(200 ..< 300).contains(response.statusCode)
+        }
+        guard shouldRetain else {
+            (forwardingDelegate as? any URLSessionDataDelegate)?
+                .urlSession(session, dataTask: dataTask, didReceive: data)
+            return
+        }
         let receipt = lock.withLock { () -> DataReceipt in
             guard !state.completed, let response = state.response else { return .ignored }
             guard data.count <= state.limit - state.data.count else {
@@ -408,7 +437,12 @@ final class BoundedURLSessionLoader: NSObject, URLSessionDataDelegate, @unchecke
         let result = lock.withLock { () -> RESTResponse? in
             guard let response = state.response else { return nil }
             let headers = URLSessionTransport.responseHeaders(from: response)
-            return RESTResponse(data: state.data, statusCode: response.statusCode, headers: headers)
+            return RESTResponse(
+                data: state.data,
+                statusCode: response.statusCode,
+                headers: headers,
+                url: response.url
+            )
         }
         complete(result.map(Result.success) ?? .failure(URLError(.badServerResponse)))
     }

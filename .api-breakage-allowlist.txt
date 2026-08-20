@@ -42,3 +42,13 @@ API breakage: var RESTResponseTooLargeError.declaredContentLength has been added
 API breakage: var RESTResponseTooLargeError.observedByteCount has been added as a stored property
 API breakage: var RESTResponseTooLargeError.phase has been added as a stored property
 API breakage: enumelement RESTRequestError.duplicateHeaderField has been added as a new enum case
+API breakage: func PaginatedRESTClient.streamAllPages(_:path:sort:) has return type change from _Concurrency.AsyncThrowingStream<[W.Item], any Swift.Error> to PaginatedRESTClient.PaginatedRESTPageStream<[W.Item]>
+API breakage: constructor RESTResponse.init(data:statusCode:headers:) has been removed
+API breakage: func RESTTransport.response(for:) has been renamed to func responseDiscardingSuccessBody(for:)
+API breakage: var RESTResponse.url has been added as a stored property
+API breakage: var RESTResponse.headerValues has been added as a computed property
+API breakage: func RESTResponse.values(forHTTPHeaderField:) has been added
+API breakage: constructor RESTResponse.init(data:statusCode:headerValues:url:) has been added
+API breakage: constructor RESTResponse.init(data:statusCode:headers:url:) has been added
+API breakage: func URLSessionTransport.responseDiscardingSuccessBody(for:) has been added
+API breakage: protocol PaginatedRESTPageStream has been added
