@@ -597,7 +597,7 @@ struct PaginatedRESTClientTests {
 
     @Test
     func `custom decoding failures use the configured mapping`() async throws {
-        let client = PaginatedRESTClient(
+        let client = try PaginatedRESTClient(
             apiKey: "test-key",
             baseURL: try #require(URL(string: "https://example.test")),
             transport: FixedResponseTransport(data: Data("{}".utf8), status: 200),
@@ -619,7 +619,7 @@ struct PaginatedRESTClientTests {
     @Test
     func `mapped HTTP bodies are bounded sanitized and marked when truncated`() async throws {
         let body = Data([0, 0xFF]) + Data(repeating: 97, count: 20_000)
-        let client = PaginatedRESTClient(
+        let client = try PaginatedRESTClient(
             apiKey: "test-key",
             baseURL: try #require(URL(string: "https://example.test")),
             transport: FixedResponseTransport(data: body, status: 500),
@@ -720,7 +720,7 @@ struct PaginatedRESTClientTests {
 
     @Test
     func `an empty API key fails before any request`() async throws {
-        let client = PaginatedRESTClient(
+        let client = try PaginatedRESTClient(
             apiKey: "",
             baseURL: try #require(URL(string: "https://example.test")),
             transport: StubTransport(),
@@ -738,7 +738,7 @@ struct PaginatedRESTClientTests {
 extension PaginatedRESTClientTests {
     @Test(arguments: ["   ", "\n\t", "key\nsecond", "key\u{7F}"])
     func `invalid bearer keys cannot build authorized requests`(apiKey: String) async throws {
-        let client = PaginatedRESTClient(
+        let client = try PaginatedRESTClient(
             apiKey: apiKey,
             baseURL: try #require(URL(string: "https://example.test")),
             transport: StubTransport(),
@@ -754,7 +754,7 @@ extension PaginatedRESTClientTests {
 
     @Test
     func `bearer keys are trimmed before use`() throws {
-        let client = PaginatedRESTClient(
+        let client = try PaginatedRESTClient(
             apiKey: "  test-key\n",
             baseURL: try #require(URL(string: "https://example.test")),
             decoderFactory: { JSONDecoder() },
@@ -828,6 +828,17 @@ extension PaginatedRESTClientTests {
     func `an empty next page terminates the walk without an error`() async throws {
         let captured = CapturedRequests()
         let client = makeClient(transport: NextPageTransport(nextPage: "", captured: captured))
+
+        let items = try await client.fetchAllPages(Unidentified.self, path: "/things/")
+
+        #expect(items == [Thing(id: 1)])
+        #expect(captured.values.count == 1)
+    }
+
+    @Test(arguments: [" ", "\t", "\n", "  \t\n"])
+    func `whitespace-only next page terminates the walk without an error`(nextPage: String) async throws {
+        let captured = CapturedRequests()
+        let client = makeClient(transport: NextPageTransport(nextPage: nextPage, captured: captured))
 
         let items = try await client.fetchAllPages(Unidentified.self, path: "/things/")
 
@@ -988,6 +999,74 @@ struct RateLimitRetryTests {
         #expect(PaginatedRESTClient.retryAfterDelay("not a date", relativeTo: now) == nil)
         #expect(PaginatedRESTClient.retryAfterDelay("-1", relativeTo: now) == nil)
         #expect(PaginatedRESTClient.retryAfterDelay(String(repeating: "9", count: 400), relativeTo: now) == nil)
+    }
+
+    @Test
+    func `rejects malformed Retry-After HTTP dates`() throws {
+        var components = DateComponents()
+        components.calendar = Calendar(identifier: .gregorian)
+        components.timeZone = TimeZone(secondsFromGMT: 0)
+        components.year = 1994
+        components.month = 11
+        components.day = 6
+        components.hour = 8
+        components.minute = 49
+        components.second = 7
+        let now = try #require(components.date)
+
+        #expect(PaginatedRESTClient.retryAfterDelay(
+            "Wed, 21 Oct 2015 07:28:00 PST", relativeTo: now
+        ) == nil)
+        #expect(PaginatedRESTClient.retryAfterDelay(
+            "Wed, 1 Oct 2015 07:28:00 GMT", relativeTo: now
+        ) == nil)
+        #expect(PaginatedRESTClient.retryAfterDelay(
+            "Mon, 06 Nov 1994 08:49:37 GMT", relativeTo: now
+        ) == nil)
+    }
+
+    @Test
+    func `RFC850 two-digit years follow the fifty-year window`() throws {
+        var components = DateComponents()
+        components.calendar = Calendar(identifier: .gregorian)
+        components.timeZone = TimeZone(secondsFromGMT: 0)
+        components.year = 2026
+        components.month = 8
+        components.day = 20
+        components.hour = 12
+        let now = try #require(components.date)
+
+        #expect(PaginatedRESTClient.interpretTwoDigitYear(70, relativeTo: now) == 2070)
+        #expect(PaginatedRESTClient.interpretTwoDigitYear(80, relativeTo: now) == 1980)
+
+        let delay = PaginatedRESTClient.retryAfterDelay(
+            "Sunday, 02-Nov-70 08:49:37 GMT",
+            relativeTo: now
+        )
+        #expect(delay != nil)
+        #expect(delay! > 60 * 60 * 24 * 365) // well into the future (2070)
+    }
+
+    @Test
+    func `public initializer rejects invalid base URLs`() async {
+        await #expect(throws: TestErrors.Failure.invalidRequest) {
+            _ = try PaginatedRESTClient(
+                apiKey: "key",
+                baseURL: URL(string: "file:///tmp")!,
+                decoderFactory: { JSONDecoder() },
+                encoderFactory: { JSONEncoder() },
+                errors: TestErrors()
+            )
+        }
+        await #expect(throws: TestErrors.Failure.invalidRequest) {
+            _ = try PaginatedRESTClient(
+                apiKey: "key",
+                baseURL: URL(string: "https://user@example.test")!,
+                decoderFactory: { JSONDecoder() },
+                encoderFactory: { JSONEncoder() },
+                errors: TestErrors()
+            )
+        }
     }
 
     @Test
@@ -1450,7 +1529,7 @@ struct PaginationIssueRegressionTests {
     @Test
     func `a nil next page on the first response stops parallel speculation`() async throws {
         let log = RequestLog()
-        let transport = ScriptedTransport(
+        _ = ScriptedTransport(
             pages: [Array(1 ... 10), Array(11 ... 20)],
             total: 20,
             outOfRange: .notFound,
@@ -1826,6 +1905,15 @@ struct ClientIssueRegressionTests {
     }
 
     @Test
+    func `performNoContentWithRetry retries transient 503 responses`() async throws {
+        let transport = RetryOnceTransport(retryAfter: "0", status: 503)
+        let client = makeClient(transport: transport)
+        let request = try client.authorizedRequest(method: "DELETE", path: "/things/1")
+        try await client.performNoContentWithRetry(request: request, maxAttempts: 3)
+        #expect(transport.requestCount == 2)
+    }
+
+    @Test
     func `send rejects GET with a JSON body`() async throws {
         await #expect(throws: TestErrors.Failure.invalidRequest) {
             try await makeClient().send(
@@ -1838,7 +1926,7 @@ struct ClientIssueRegressionTests {
 
     @Test
     func `cancellationError from a transport is not classified as transient`() async throws {
-        let client = PaginatedRESTClient(
+        let client = try PaginatedRESTClient(
             apiKey: "key",
             baseURL: URL(string: "https://example.test")!,
             transport: CancellationProbeTransport(),
@@ -1862,7 +1950,7 @@ struct ClientIssueRegressionTests {
         }
         let sink = LogSink()
         let transport = RetryOnceTransport(retryAfter: nil, status: 500)
-        let client = PaginatedRESTClient(
+        let client = try PaginatedRESTClient(
             apiKey: "key",
             baseURL: URL(string: "https://example.test")!,
             transport: transport,

@@ -36,6 +36,23 @@ own app or a small wrapper module that already depends on the client.
   retry). Clients that wrap transport errors in their own type should unwrap back to
   `URLError` so that mapping keeps working.
 
+## Redirect credential safety
+
+``PaginatedRESTClient/authorizedGET(_:)`` and the other authenticated builders validate only
+the *initial* URL. Once a ``RESTRequest`` is handed to your transport, **redirect handling is
+entirely yours.**
+
+If the request carries `Authorization` (or any other secret header), a transport must either:
+
+1. Refuse redirects that leave the request's HTTP(S) origin (scheme, host, and effective port),
+   including destinations that add URL userinfo, or
+2. Strip credential headers before following a cross-origin redirect.
+
+``URLSessionTransport`` does (1) through ``SameOriginRedirectDelegate``. A literal adapter
+that blindly replays the original ``RESTRequest/headers`` on every hop can reintroduce a
+credential leak. Treat same-origin redirect policy as part of the ``RESTTransport`` contract,
+not an optional URLSession detail.
+
 ## Get (kean/Get)
 
 [Get](https://github.com/kean/Get) is a thin async wrapper over `URLSession`. Its

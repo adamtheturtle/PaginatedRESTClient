@@ -60,6 +60,41 @@ struct URLSessionTransportTests {
         }
     }
 
+    @Test(arguments: [
+        URL(string: "file:///tmp/body")!,
+        URL(string: "ftp://example.test/file")!,
+        URL(string: "https://user@example.test/path")!
+    ])
+    func `non-HTTP request URLs are rejected before transport`(url: URL) async {
+        let request = RESTRequest(url: url, method: "GET")
+
+        await #expect(throws: RESTRequestError.unsupportedURL(url)) {
+            _ = try await URLSessionTransport().response(for: request)
+        }
+    }
+
+    @Test(arguments: ["", "GET ", "GET\r\nX-Evil: true", "PÖST"])
+    func `invalid HTTP method tokens are rejected before transport`(method: String) async {
+        let request = RESTRequest(url: URL(string: "https://example.test/")!, method: method)
+
+        await #expect(throws: RESTRequestError.invalidHTTPMethod(method)) {
+            _ = try await URLSessionTransport().response(for: request)
+        }
+    }
+
+    @Test
+    func `invalid HTTP header fields are rejected before transport`() async {
+        let request = RESTRequest(
+            url: URL(string: "https://example.test/")!,
+            method: "GET",
+            headers: ["Good\r\nInjected": "value"]
+        )
+
+        await #expect(throws: RESTRequestError.invalidHeaderField) {
+            _ = try await URLSessionTransport().response(for: request)
+        }
+    }
+
     @Test
     func `a directory is rejected as a file-backed request body`() async throws {
         let request = RESTRequest(
@@ -161,7 +196,7 @@ struct URLSessionTransportTests {
     func `the client maps a response overflow through its decode error policy`() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [ResponseLimitURLProtocol.self]
-        let client = PaginatedRESTClient(
+        let client = try PaginatedRESTClient(
             apiKey: "key",
             baseURL: URL(string: "https://example.test")!,
             transport: URLSessionTransport(
@@ -188,7 +223,7 @@ struct URLSessionTransportTests {
     func `the client maps an error-status overflow through its http error policy`() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [ResponseLimitURLProtocol.self]
-        let client = PaginatedRESTClient(
+        let client = try PaginatedRESTClient(
             apiKey: "key",
             baseURL: URL(string: "https://example.test")!,
             transport: URLSessionTransport(
