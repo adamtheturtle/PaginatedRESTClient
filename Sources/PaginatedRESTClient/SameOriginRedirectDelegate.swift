@@ -194,19 +194,34 @@ final nonisolated class SameOriginRedirectDelegate: NSObject, URLSessionTaskDele
             completionHandler(.continueLoading, nil)
             return
         }
+        let validatedHandler: @Sendable (
+            URLSession.DelayedRequestDisposition,
+            URLRequest?
+        ) -> Void = { [self] disposition, newRequest in
+            switch disposition {
+            case .useNewRequest:
+                guard let newRequest, allows(newRequest) else {
+                    completionHandler(.cancel, nil)
+                    return
+                }
+                completionHandler(.useNewRequest, newRequest)
+            default:
+                completionHandler(disposition, newRequest)
+            }
+        }
         #if canImport(FoundationNetworking)
         forwardingDelegate.urlSession(
             session,
             task: task,
             willBeginDelayedRequest: request,
-            completionHandler: completionHandler
+            completionHandler: validatedHandler
         )
         #else
         let forwarded: Void? = forwardingDelegate.urlSession?(
             session,
             task: task,
             willBeginDelayedRequest: request,
-            completionHandler: completionHandler
+            completionHandler: validatedHandler
         )
         if forwarded == nil {
             completionHandler(.continueLoading, nil)

@@ -41,3 +41,4 @@ API breakage: var RESTResponse.headers is now with nonisolated
 API breakage: var RESTResponseTooLargeError.declaredContentLength has been added as a stored property
 API breakage: var RESTResponseTooLargeError.observedByteCount has been added as a stored property
 API breakage: var RESTResponseTooLargeError.phase has been added as a stored property
+API breakage: enumelement RESTRequestError.duplicateHeaderField has been added as a new enum case

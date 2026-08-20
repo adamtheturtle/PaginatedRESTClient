@@ -444,6 +444,7 @@ public struct PaginatedRESTClient {
                 if failure.response.statusCode == 429 {
                     guard attempt < retryAttempts, errors.isTransient(failure.mappedError) else {
                         observeRateLimitCooldown(from: failure.response)
+                        try Task.checkCancellation()
                         throw failure.mappedError
                     }
                     let now = retryRuntime.now()
@@ -465,6 +466,7 @@ public struct PaginatedRESTClient {
                 }
 
                 guard attempt < retryAttempts, errors.isTransient(failure.mappedError) else {
+                    try Task.checkCancellation()
                     throw failure.mappedError
                 }
 
@@ -494,7 +496,10 @@ public struct PaginatedRESTClient {
                 throw mappedRequestError(requestError)
             } catch {
                 attempt += 1
-                guard attempt < retryAttempts, errors.isTransient(error) else { throw error }
+                guard attempt < retryAttempts, errors.isTransient(error) else {
+                    try Task.checkCancellation()
+                    throw error
+                }
 
                 emitLog("Transient failure; retry \(attempt)/\(retryAttempts - 1)")
                 // Preserve the existing 300ms, then 600ms exponential policy for
@@ -572,6 +577,7 @@ public struct PaginatedRESTClient {
             return try await performAttempt(type, request: request)
         } catch let failure as HTTPAttemptFailure {
             observeRateLimitCooldown(from: failure.response)
+            try Task.checkCancellation()
             throw failure.mappedError
         } catch let bodyError as RESTRequestBodyError {
             throw mappedBodyError(bodyError)
@@ -691,6 +697,8 @@ public struct PaginatedRESTClient {
             errors.invalidRequest("Unsupported URL \(url.absoluteString)")
         case .invalidHeaderField:
             errors.invalidRequest("Request contains an invalid HTTP header field")
+        case let .duplicateHeaderField(name):
+            errors.invalidRequest("Request contains duplicate HTTP header field \(name)")
         case .unsupportedBackgroundSession:
             errors.invalidRequest("Background URLSession configurations are not supported")
         }
@@ -1197,6 +1205,7 @@ public extension PaginatedRESTClient {
             }
         } catch let failure as HTTPAttemptFailure {
             observeRateLimitCooldown(from: failure.response)
+            try Task.checkCancellation()
             throw failure.mappedError
         } catch let bodyError as RESTRequestBodyError {
             throw mappedBodyError(bodyError)
@@ -1273,7 +1282,10 @@ public extension PaginatedRESTClient {
                 throw mappedRequestError(requestError)
             } catch {
                 attempt += 1
-                guard attempt < retryAttempts, errors.isTransient(error) else { throw error }
+                guard attempt < retryAttempts, errors.isTransient(error) else {
+                    try Task.checkCancellation()
+                    throw error
+                }
                 try await retryRuntime.sleep(retryBackoffDelay(retryNumber: attempt))
             }
         }
@@ -1327,7 +1339,7 @@ extension PaginatedRESTClient {
 /// The multi-page machinery: path selection, ordered stitching, and the two page-walking
 /// strategies. Split into its own extension so the type above stays the client surface
 /// (configuration, single requests, retry) and this stays the pagination algorithm.
-private extension PaginatedRESTClient {
+extension PaginatedRESTClient {
 /// Drives the page-by-page fetch, calling `emit` with each cumulative snapshot.
 /// Splits into the parallel "fast path" (when `total` is known) and the
 /// sequential `next_page` walk, both extracted into helpers below.
@@ -1705,6 +1717,15 @@ nonisolated func canonicalPageURL(_ url: URL) -> URL {
     components.host = components.host?.lowercased()
     if components.port == defaultPort(for: components.scheme) { components.port = nil }
     components.fragment = nil
+    // Reordered query forms must share one identity so cycle detection cannot be evaded
+    // by superficial URL spelling differences. Assigning `queryItems` also normalizes
+    // equivalent percent-encoding when the URL is rebuilt.
+    if let items = components.queryItems, !items.isEmpty {
+        components.queryItems = items.sorted {
+            if $0.name != $1.name { return $0.name < $1.name }
+            return ($0.value ?? "") < ($1.value ?? "")
+        }
+    }
     return components.url?.standardized ?? standardized
 }
 }

@@ -83,6 +83,27 @@ struct URLSessionTransportTests {
     }
 
     @Test
+    func `duplicate case-variant request headers are rejected before transport`() async {
+        let request = RESTRequest(
+            url: URL(string: "https://example.test/")!,
+            method: "GET",
+            headers: ["Authorization": "Bearer a", "authorization": "Bearer b"]
+        )
+
+        do {
+            _ = try await URLSessionTransport().response(for: request)
+            Issue.record("Expected duplicate header rejection")
+        } catch let error as RESTRequestError {
+            guard case .duplicateHeaderField = error else {
+                Issue.record("Unexpected RESTRequestError \(error)")
+                return
+            }
+        } catch {
+            Issue.record("Unexpected error \(error)")
+        }
+    }
+
+    @Test
     func `invalid HTTP header fields are rejected before transport`() async {
         let request = RESTRequest(
             url: URL(string: "https://example.test/")!,
