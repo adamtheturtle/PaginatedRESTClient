@@ -31,33 +31,39 @@ private nonisolated func makeURLSessionTransportFromNonisolatedContext() -> URLS
     URLSessionTransport()
 }
 
-private nonisolated func makeRESTValuesFromNonisolatedContext() -> (RESTRequest, RESTResponse, RESTResponseTooLargeError) {
+private nonisolated struct IsolationProbeValues {
+    let request: RESTRequest
+    let response: RESTResponse
+    let overflow: RESTResponseTooLargeError
+}
+
+private nonisolated func makeRESTValuesFromNonisolatedContext() -> IsolationProbeValues {
     let request = RESTRequest(
         url: URL(string: "https://example.test/item")!,
         method: "GET"
     )
     let response = RESTResponse(data: Data(), statusCode: 200)
     let overflow = RESTResponseTooLargeError(statusCode: 200, limit: 8, phase: .body)
-    return (request, response, overflow)
+    return IsolationProbeValues(request: request, response: response, overflow: overflow)
 }
 
 @Suite("Initializer isolation")
 struct InitializerIsolationTests {
     @Test
-    func `PaginatedRESTClient can be constructed from a nonisolated context`() {
+    func `paginatedRESTClient can be constructed from a nonisolated context`() {
         _ = makePaginatedRESTClientFromNonisolatedContext()
     }
 
     @Test
-    func `URLSessionTransport can be constructed from a nonisolated context`() {
+    func `urlSessionTransport can be constructed from a nonisolated context`() {
         _ = makeURLSessionTransportFromNonisolatedContext()
     }
 
     @Test
-    func `REST request response and overflow errors construct from a nonisolated context`() {
-        let (request, response, overflow) = makeRESTValuesFromNonisolatedContext()
-        #expect(request.method == "GET")
-        #expect(response.statusCode == 200)
-        #expect(overflow.limit == 8)
+    func `rest request response and overflow errors construct from a nonisolated context`() {
+        let values = makeRESTValuesFromNonisolatedContext()
+        #expect(values.request.method == "GET")
+        #expect(values.response.statusCode == 200)
+        #expect(values.overflow.limit == 8)
     }
 }

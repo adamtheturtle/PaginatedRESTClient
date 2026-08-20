@@ -1393,7 +1393,10 @@ struct PaginationIssueRegressionTests {
         )
         // Override page 1 to omit next_page while still advertising a multi-page total.
         let captured = CapturedRequests()
-        let first = #"{"things":[{"id":1},{"id":2},{"id":3},{"id":4},{"id":5},{"id":6},{"id":7},{"id":8},{"id":9},{"id":10}],"next_page":null,"total":20}"#
+        let first = """
+        {"things":[{"id":1},{"id":2},{"id":3},{"id":4},{"id":5},\
+        {"id":6},{"id":7},{"id":8},{"id":9},{"id":10}],"next_page":null,"total":20}
+        """
         let client = makeClient(
             transport: FirstThenNumberedTransport(first: first, later: [
                 2: #"{"things":[{"id":11}],"next_page":null,"total":20}"#
@@ -1441,7 +1444,10 @@ struct PaginationIssueRegressionTests {
     func `an empty first page with a positive total still fetches later pages`() async throws {
         let captured = CapturedRequests()
         let first = #"{"things":[],"next_page":null,"total":20}"#
-        let page2 = #"{"things":[{"id":11},{"id":12},{"id":13},{"id":14},{"id":15},{"id":16},{"id":17},{"id":18},{"id":19},{"id":20}],"next_page":null,"total":20}"#
+        let page2 = """
+        {"things":[{"id":11},{"id":12},{"id":13},{"id":14},{"id":15},\
+        {"id":16},{"id":17},{"id":18},{"id":19},{"id":20}],"next_page":null,"total":20}
+        """
         let client = makeClient(
             transport: FirstThenNumberedTransport(first: first, later: [2: page2], captured: captured)
         )
@@ -1621,6 +1627,21 @@ struct PaginationIssueRegressionTests {
     }
 }
 
+private nonisolated struct CancellationProbeTransport: RESTTransport {
+    func data(for _: RESTRequest) async throws -> (Data, Int) {
+        throw CancellationError()
+    }
+}
+
+private struct BroadlyTransientErrors: RESTTransportErrorMapping {
+    enum Failure: Error { case other }
+    nonisolated func missingAPIKey() -> any Error { Failure.other }
+    nonisolated func http(status _: Int, body _: String) -> any Error { Failure.other }
+    nonisolated func decode(_: String) -> any Error { Failure.other }
+    nonisolated func network(_: URLError) -> any Error { Failure.other }
+    nonisolated func isTransient(_: any Error) -> Bool { true }
+}
+
 @Suite("Client open-issue regressions")
 struct ClientIssueRegressionTests {
     @Test
@@ -1636,9 +1657,6 @@ struct ClientIssueRegressionTests {
 
     @Test
     func `root coding path is reported as dollar`() async throws {
-        let client = makeClient(
-            transport: FixedResponseTransport(data: Data("[]".utf8), status: 200)
-        )
         let error = await #expect(throws: DetailedFailure.self) {
             _ = try await PaginatedRESTClient(
                 apiKey: "key",
@@ -1654,7 +1672,6 @@ struct ClientIssueRegressionTests {
             return
         }
         #expect(detail.contains("at $"))
-        _ = client
     }
 
     @Test
@@ -1669,27 +1686,14 @@ struct ClientIssueRegressionTests {
     }
 
     @Test
-    func `CancellationError from a transport is not classified as transient`() async throws {
-        struct CancelTransport: RESTTransport {
-            func data(for _: RESTRequest) async throws -> (Data, Int) {
-                throw CancellationError()
-            }
-        }
-        struct BroadTransient: RESTTransportErrorMapping {
-            enum Failure: Error { case other }
-            nonisolated func missingAPIKey() -> any Error { Failure.other }
-            nonisolated func http(status _: Int, body _: String) -> any Error { Failure.other }
-            nonisolated func decode(_: String) -> any Error { Failure.other }
-            nonisolated func network(_: URLError) -> any Error { Failure.other }
-            nonisolated func isTransient(_: any Error) -> Bool { true }
-        }
+    func `cancellationError from a transport is not classified as transient`() async throws {
         let client = PaginatedRESTClient(
             apiKey: "key",
             baseURL: URL(string: "https://example.test")!,
-            transport: CancelTransport(),
+            transport: CancellationProbeTransport(),
             decoderFactory: { JSONDecoder() },
             encoderFactory: { JSONEncoder() },
-            errors: BroadTransient()
+            errors: BroadlyTransientErrors()
         )
         let request = try client.authorizedGET(#require(URL(string: "https://example.test/things/1")))
         await #expect(throws: CancellationError.self) {

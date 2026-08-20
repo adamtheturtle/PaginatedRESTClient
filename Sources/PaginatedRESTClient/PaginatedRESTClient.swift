@@ -812,7 +812,7 @@ public extension PaginatedRESTClient {
     }
 
     /// Validates that `url` stays on the configured HTTP(S) origin without URL userinfo,
-    /// matching the credential-safety rules used by ``fetch``.
+    /// matching the credential-safety rules used by ``fetch(_:path:)``.
     nonisolated func validatedAuthenticatedURL(_ url: URL) throws -> URL {
         guard SameOriginRedirectDelegate.hasSameOrigin(baseURL, url),
               let components = URLComponents(url: url, resolvingAgainstBaseURL: false),

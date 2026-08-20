@@ -34,21 +34,19 @@ jobs:
         run: swiftlint lint --strict
 
   macos:
-    name: macOS (Swift ${{ matrix.swift }})
+    name: macOS (Xcode ${{ matrix.xcode }})
     runs-on: macos-26
     strategy:
       fail-fast: false
       matrix:
-        # The package requires swift-tools-version 6.2 (defaultIsolation, raw
-        # identifiers, NonisolatedNonsendingByDefault). latest-stable Xcode on the
-        # macos-26 image provides Swift 6.2+. Include an explicit 6.2 pin so the
-        # minimum toolchain stays covered (issue #157).
-        swift: ["6.2", "latest-stable"]
+        # The package requires swift-tools-version 6.2. Pin the oldest Xcode on
+        # macos-26 that still provides that toolchain, plus latest-stable.
+        xcode: ["26.0.1", "latest-stable"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.0
       - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
         with:
-          xcode-version: ${{ matrix.swift }}
+          xcode-version: ${{ matrix.xcode }}
       - name: Swift version
         run: swift --version
       - name: Build
@@ -117,7 +115,7 @@ jobs:
           xcode-version: latest-stable
       - name: Build documentation catalog
         run: |
-          swift package plugin --disable-sandbox generate-documentation \
+          swift package --allow-writing-to-directory .build/docs generate-documentation \
             --target PaginatedRESTClient \
             --disable-indexing \
             --transform-for-static-hosting \
