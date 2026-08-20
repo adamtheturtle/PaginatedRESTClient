@@ -107,15 +107,29 @@ public extension RESTTransportErrorMapping {
 
 // MARK: - Retry coordination
 
-/// Injectable sources used by retry tests. Production clients use wall-clock time,
-/// cancellable `Task.sleep`, and system randomness.
+/// Injectable sources used by retry tests. Production cooldowns use monotonic uptime;
+/// wall-clock time is retained only for interpreting HTTP dates.
 nonisolated struct RetryRuntime: Sendable {
     let now: @Sendable () -> Date
+    let monotonicNow: @Sendable () -> TimeInterval
     let sleep: @Sendable (TimeInterval) async throws -> Void
     let jitter: @Sendable () -> Double
 
+    init(
+        now: @escaping @Sendable () -> Date,
+        monotonicNow: (@Sendable () -> TimeInterval)? = nil,
+        sleep: @escaping @Sendable (TimeInterval) async throws -> Void,
+        jitter: @escaping @Sendable () -> Double
+    ) {
+        self.now = now
+        self.monotonicNow = monotonicNow ?? { now().timeIntervalSinceReferenceDate }
+        self.sleep = sleep
+        self.jitter = jitter
+    }
+
     static let live = RetryRuntime(
         now: Date.init,
+        monotonicNow: { ProcessInfo.processInfo.systemUptime },
         sleep: { delay in try await Task.sleep(for: .seconds(delay)) },
         jitter: { Double.random(in: 0 ... 1) }
     )
@@ -125,32 +139,32 @@ nonisolated struct RetryRuntime: Sendable {
 /// while allowing every concurrent pagination task to publish and observe one cooldown.
 nonisolated final class RateLimitCooldown: @unchecked Sendable {
     private struct Window {
-        var startedAt: Date
-        var deadline: Date
+        var startedAt: TimeInterval
+        var deadline: TimeInterval
     }
 
     private let lock = NSLock()
     private var windows: [String: Window] = [:]
 
     func extend(
-        until candidate: Date,
-        observedAt now: Date,
+        until candidate: TimeInterval,
+        observedAt now: TimeInterval,
         maximumWindow: TimeInterval,
         for key: String
     ) {
         lock.withLock {
             var window = windows[key].flatMap { $0.deadline > now ? $0 : nil }
                 ?? Window(startedAt: now, deadline: now)
-            let capped = min(candidate, window.startedAt.addingTimeInterval(maximumWindow))
+            let capped = min(candidate, window.startedAt + maximumWindow)
             if capped > window.deadline { window.deadline = capped }
             windows[key] = window
         }
     }
 
-    func remaining(at now: Date, for key: String) -> TimeInterval? {
+    func remaining(at now: TimeInterval, for key: String) -> TimeInterval? {
         lock.withLock {
             guard let window = windows[key] else { return nil }
-            let delay = window.deadline.timeIntervalSince(now)
+            let delay = window.deadline - now
             if delay > 0 { return delay }
             windows[key] = nil
             return nil
@@ -169,6 +183,66 @@ private nonisolated struct HTTPAttemptFailure: Error {
 /// same oversized response, while retaining the error that public APIs expose.
 private nonisolated struct ResponseOverflowFailure: Error {
     let mappedError: any Error
+}
+
+private nonisolated struct DecodedAttempt<Value: Sendable>: Sendable {
+    let value: Value
+    let responseURL: URL
+}
+
+/// A lazy page stream. Work begins with the iterator's first `next()` call and is
+/// cancelled when that iterator is released, even if the sequence value is retained.
+public nonisolated struct PaginatedRESTPageStream<Element: Sendable>: AsyncSequence, Sendable {
+    public typealias Failure = any Error
+
+    private let produce: @Sendable (@escaping @Sendable (Element) -> Void) async throws -> Void
+
+    nonisolated init(
+        produce: @escaping @Sendable (@escaping @Sendable (Element) -> Void) async throws -> Void
+    ) {
+        self.produce = produce
+    }
+
+    public nonisolated func makeAsyncIterator() -> Iterator {
+        Iterator(produce: produce)
+    }
+
+    public nonisolated final class Iterator: AsyncIteratorProtocol, @unchecked Sendable {
+        private let produce: @Sendable (@escaping @Sendable (Element) -> Void) async throws -> Void
+        private var iterator: AsyncThrowingStream<Element, any Error>.Iterator?
+        private var work: Task<Void, Never>?
+
+        fileprivate init(
+            produce: @escaping @Sendable (@escaping @Sendable (Element) -> Void) async throws -> Void
+        ) {
+            self.produce = produce
+        }
+
+        deinit {
+            work?.cancel()
+        }
+
+        public func next() async throws -> Element? {
+            if iterator == nil {
+                let (stream, continuation) = AsyncThrowingStream<Element, any Error>.makeStream(
+                    bufferingPolicy: .bufferingNewest(1)
+                )
+                let produce = produce
+                let work = Task {
+                    do {
+                        try await produce { continuation.yield($0) }
+                        continuation.finish()
+                    } catch {
+                        continuation.finish(throwing: error)
+                    }
+                }
+                continuation.onTermination = { _ in work.cancel() }
+                iterator = stream.makeAsyncIterator()
+                self.work = work
+            }
+            return try await iterator?.next()
+        }
+    }
 }
 
 // MARK: - Client
@@ -409,31 +483,9 @@ public struct PaginatedRESTClient {
         _: W.Type,
         path: String,
         sort: String? = nil
-    ) -> AsyncThrowingStream<[W.Item], Error> {
-        AsyncThrowingStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
-            // This method is `nonisolated`, and so is the networking it calls, so this
-            // unstructured `Task` does not inherit the module's default main-actor
-            // isolation - the pipeline, including the concurrent child tasks below,
-            // runs on the cooperative pool. That keeps the list-building work (URL
-            // construction, snapshot accumulation) off the main thread while pages
-            // stream in. The `nonisolated` on *this* method is what makes that true:
-            // `AsyncThrowingStream`'s build closure is non-`Sendable` and non-escaping,
-            // so it inherits the enclosing isolation, and a plain `Task` created from a
-            // MainActor-isolated context inherits the main actor regardless of
-            // Sendability. With `NonisolatedNonsendingByDefault` the `nonisolated` async
-            // callees then run on *this* task's executor, so they stay off the main
-            // actor too.
-            let work = Task {
-                do {
-                    _ = try await drivePagination(W.self, path: path, sort: sort) {
-                        continuation.yield($0)
-                    }
-                    continuation.finish()
-                } catch {
-                    continuation.finish(throwing: error)
-                }
-            }
-            continuation.onTermination = { _ in work.cancel() }
+    ) -> PaginatedRESTPageStream<[W.Item]> {
+        PaginatedRESTPageStream { emit in
+            _ = try await drivePagination(W.self, path: path, sort: sort, emit: emit)
         }
     }
 
@@ -447,12 +499,17 @@ public struct PaginatedRESTClient {
         request: RESTRequest,
         maxAttempts: Int? = nil
     ) async throws -> T {
+        try await performWithRetryAttempt(type, request: request, maxAttempts: maxAttempts).value
+    }
+
+    private nonisolated func performWithRetryAttempt<T: Decodable & Sendable>(
+        _ type: T.Type,
+        request: RESTRequest,
+        maxAttempts: Int? = nil
+    ) async throws -> DecodedAttempt<T> {
         let attempts = maxAttempts ?? self.maxAttempts
         guard attempts > 0 else { throw errors.decode("maxAttempts must be positive") }
-        guard Self.methodIsIdempotent(request.method) else {
-            return try await perform(type, request: request)
-        }
-        let retryAttempts = request.bodyFileURL == nil ? attempts : 1
+        let retryAttempts = Self.methodIsIdempotent(request.method) && request.bodyFileURL == nil ? attempts : 1
 
         var attempt = 0
         while true {
@@ -473,7 +530,7 @@ public struct PaginatedRESTClient {
                         retryNumber: attempt,
                         jitter: retryRuntime.jitter()
                     ))
-                    extendRateLimitCooldown(by: delay, observedAt: now, request: request)
+                    extendRateLimitCooldown(by: delay, request: request)
                     emitLog(
                         "Rate limited; retry \(attempt)/\(retryAttempts - 1) "
                             + "after shared \(String(format: "%.3f", delay))s cooldown"
@@ -530,19 +587,19 @@ public struct PaginatedRESTClient {
         _ type: T.Type,
         method: String,
         path: String,
-        body: some Encodable
+        body: some Encodable & Sendable
     ) async throws -> T {
-        try await perform(type, request: try makeSendRequest(method: method, path: path, body: body))
+        try await perform(type, request: try await makeSendRequest(method: method, path: path, body: body))
     }
 
     /// Sends a JSON body when the response has no model (for example HTTP 204/205).
     public nonisolated func send(
         method: String,
         path: String,
-        body: some Encodable
+        body: some Encodable & Sendable
     ) async throws {
         try await performNoContentWithRetry(
-            request: try makeSendRequest(method: method, path: path, body: body)
+            request: try await makeSendRequest(method: method, path: path, body: body)
         )
     }
 
@@ -591,7 +648,7 @@ public struct PaginatedRESTClient {
         request: RESTRequest
     ) async throws -> T {
         do {
-            return try await performAttempt(type, request: request)
+            return try await performAttempt(type, request: request).value
         } catch let failure as HTTPAttemptFailure {
             observeRateLimitCooldown(from: failure.response, request: request)
             try Task.checkCancellation()
@@ -608,7 +665,7 @@ public struct PaginatedRESTClient {
     private nonisolated func performAttempt<T: Decodable & Sendable>(
         _ type: T.Type,
         request: RESTRequest
-    ) async throws -> T {
+    ) async throws -> DecodedAttempt<T> {
         let response: RESTResponse
         do {
             response = try await transportResponse(for: request)
@@ -629,7 +686,8 @@ public struct PaginatedRESTClient {
             // Decode off the main actor: the client may be MainActor-isolated, so on a large
             // list (many pages × nested objects) decoding here would hitch the UI.
             // `Data` and `T` are Sendable, so the work crosses the boundary cleanly.
-            return try await decodeInBackground(T.self, from: response.data)
+            let value = try await decodeInBackground(T.self, from: response.data)
+            return DecodedAttempt(value: value, responseURL: response.url ?? request.url)
         } catch let DecodingError.keyNotFound(key, ctx) {
             throw errors.decode("missing key '\(key.stringValue)' at \(pathString(ctx.codingPath))")
         } catch let DecodingError.valueNotFound(type, ctx) {
@@ -645,12 +703,18 @@ public struct PaginatedRESTClient {
         }
     }
 
-    private nonisolated func transportResponse(for request: RESTRequest) async throws -> RESTResponse {
+    private nonisolated func transportResponse(
+        for request: RESTRequest,
+        discardingSuccessBody: Bool = false
+    ) async throws -> RESTResponse {
         try request.validate()
         try await waitForRateLimitCooldown(for: request)
         try Task.checkCancellation()
 
         do {
+            if discardingSuccessBody {
+                return try await transport.responseDiscardingSuccessBody(for: request)
+            }
             return try await transport.response(for: request)
         } catch is CancellationError {
             throw CancellationError()
@@ -699,16 +763,16 @@ public struct PaginatedRESTClient {
             maxRetryDelay,
             retryAfter ?? Self.rateLimitFallbackDelay(retryNumber: 1, jitter: retryRuntime.jitter())
         )
-        extendRateLimitCooldown(by: delay, observedAt: now, request: request)
+        extendRateLimitCooldown(by: delay, request: request)
     }
 
     private nonisolated func extendRateLimitCooldown(
         by delay: TimeInterval,
-        observedAt now: Date,
         request: RESTRequest
     ) {
+        let now = retryRuntime.monotonicNow()
         rateLimitCooldown.extend(
-            until: now.addingTimeInterval(delay),
+            until: now + delay,
             observedAt: now,
             maximumWindow: maxRetryDelay,
             for: Self.rateLimitOriginKey(request.url)
@@ -734,11 +798,11 @@ public struct PaginatedRESTClient {
         }
     }
 
-    private nonisolated func makeSendRequest(
+    private nonisolated func makeSendRequest<Body: Encodable & Sendable>(
         method: String,
         path: String,
-        body: some Encodable
-    ) throws -> RESTRequest {
+        body: Body
+    ) async throws -> RESTRequest {
         guard !apiKey.isEmpty else { throw errors.missingAPIKey() }
         guard Self.methodAllowsJSONBody(method) else {
             throw errors.invalidRequest(
@@ -747,7 +811,15 @@ public struct PaginatedRESTClient {
         }
         let encoded: Data
         do {
-            encoded = try encoderFactory().encode(body)
+            let makeEncoder = encoderFactory
+            encoded = try await withThrowingTaskGroup(of: Data.self) { group in
+                group.addTask {
+                    try Task.checkCancellation()
+                    return try makeEncoder().encode(body)
+                }
+                guard let data = try await group.next() else { throw CancellationError() }
+                return data
+            }
         } catch is CancellationError {
             throw CancellationError()
         } catch {
@@ -765,7 +837,7 @@ public struct PaginatedRESTClient {
     /// a later `Retry-After` while this task is already sleeping.
     private nonisolated func waitForRateLimitCooldown(for request: RESTRequest) async throws {
         let key = Self.rateLimitOriginKey(request.url)
-        while let delay = rateLimitCooldown.remaining(at: retryRuntime.now(), for: key) {
+        while let delay = rateLimitCooldown.remaining(at: retryRuntime.monotonicNow(), for: key) {
             try Task.checkCancellation()
             try await retryRuntime.sleep(delay)
         }
@@ -1253,7 +1325,7 @@ public extension PaginatedRESTClient {
         do {
             let response: RESTResponse
             do {
-                response = try await transportResponse(for: request)
+                response = try await transportResponse(for: request, discardingSuccessBody: true)
             } catch let overflow as RESTResponseTooLargeError {
                 throw ResponseOverflowFailure(mappedError: mappedOverflow(overflow))
             }
@@ -1298,7 +1370,7 @@ public extension PaginatedRESTClient {
             do {
                 let response: RESTResponse
                 do {
-                    response = try await transportResponse(for: request)
+                    response = try await transportResponse(for: request, discardingSuccessBody: true)
                 } catch let overflow as RESTResponseTooLargeError {
                     throw ResponseOverflowFailure(mappedError: mappedOverflow(overflow))
                 }
@@ -1330,7 +1402,7 @@ public extension PaginatedRESTClient {
                                 jitter: retryRuntime.jitter()
                             )
                     )
-                    extendRateLimitCooldown(by: delay, observedAt: now, request: request)
+                    extendRateLimitCooldown(by: delay, request: request)
                     try await waitForRateLimitCooldown(for: request)
                 } else if Self.honorsRetryAfter(statusCode: failure.response.statusCode),
                           let delay = Self.retryAfterDelay(
@@ -1492,7 +1564,7 @@ nonisolated func drivePagination<W: PagedResponse>(
     _: W.Type,
     path: String,
     sort: String?,
-    emit: ([W.Item]) -> Void
+    emit: @Sendable ([W.Item]) -> Void
 ) async throws -> [W.Item] {
     guard !apiKey.isEmpty else { throw errors.missingAPIKey() }
 
@@ -1514,9 +1586,10 @@ nonisolated func drivePagination<W: PagedResponse>(
 
     guard let firstURL = pageURL(nil) else { throw errors.invalidRequest("Invalid URL") }
 
-    let firstPage = try await performWithRetry(W.self, request: try authorizedGET(firstURL))
+    let firstAttempt = try await performWithRetryAttempt(W.self, request: try authorizedGET(firstURL))
+    let firstPage = firstAttempt.value
     let numberedTemplate = try firstPage.nextPage.flatMap {
-        try validatedNextPageURL($0, relativeTo: firstURL)
+        try validatedNextPageURL($0, relativeTo: firstAttempt.responseURL)
     }
     let numberedTemplatePage = numberedTemplate.flatMap(Self.uniqueNumericPageValue)
 
@@ -1582,7 +1655,7 @@ nonisolated func drivePagination<W: PagedResponse>(
                 replacements: [(name: "page", value: String(page))]
             )
         }
-        let tailNextPage = try await fetchKnownPages(
+        let (tailNextPage, tailResponseURL) = try await fetchKnownPages(
             W.self,
             total: total,
             pageCount: estimatedPageCount,
@@ -1596,11 +1669,10 @@ nonisolated func drivePagination<W: PagedResponse>(
                 visitedPageURLs.insert(canonicalPageURL(url))
             }
         }
-        let finalEstimatedURL = numberedPageURL(estimatedPageCount) ?? firstURL
         try await walkNextPages(
             W.self,
             from: tailNextPage,
-            relativeTo: finalEstimatedURL,
+            relativeTo: tailResponseURL,
             items: &items,
             seen: &seen,
             visitedPageURLs: &visitedPageURLs,
@@ -1615,7 +1687,7 @@ nonisolated func drivePagination<W: PagedResponse>(
     try await walkNextPages(
         W.self,
         from: firstPage.nextPage,
-        relativeTo: firstURL,
+        relativeTo: firstAttempt.responseURL,
         items: &items,
         seen: &seen,
         visitedPageURLs: &visitedPageURLs,
@@ -1663,8 +1735,8 @@ nonisolated func fetchKnownPages<W: PagedResponse>(
     items: inout [W.Item],
     seen: inout Set<AnyHashable>,
     pageURL: (Int?) -> URL?,
-    emit: ([W.Item]) -> Void
-) async throws -> String? {
+    emit: @Sendable ([W.Item]) -> Void
+) async throws -> (nextPage: String?, responseURL: URL) {
     // `total` is a lower bound on the page count: it can undercount if records are
     // created mid-load. So fetch pages 2…N in parallel, then follow `next_page` from
     // the final page to pick up any remainder rather than silently dropping records
@@ -1672,22 +1744,27 @@ nonisolated func fetchKnownPages<W: PagedResponse>(
     //
     // Metadata (page size, total range, derived page count) was already validated in
     // `drivePagination` before the first snapshot was emitted.
-    guard pageCount > 1 else { return nil }
+    guard pageCount > 1 else { return (nil, pageURL(1) ?? baseURL) }
 
     // Only the final page's `next_page` is worth following. A server that clamps an
     // out-of-range `page` returns an already-seen page whose `next_page` points back into
     // the numbered range; `advancingTailNextPage` rejects that without confusing it with
     // a legitimate duplicate-only page caused by concurrent list drift.
     var tailNextPage: String?
-    var pending: [Int: W] = [:]
+    var tailResponseURL = pageURL(pageCount) ?? baseURL
+    var pending: [Int: (page: W, responseURL: URL)] = [:]
     var nextToEmit = 2
     var collected = items
-    try await withThrowingTaskGroup(of: (Int, W).self) { group in
+    try await withThrowingTaskGroup(of: (Int, W, URL).self) { group in
         func enqueue(_ page: Int) throws {
             guard let url = pageURL(page) else { throw errors.invalidRequest("Invalid URL") }
 
             group.addTask {
-                try await (page, performWithRetry(W.self, request: try authorizedGET(url)))
+                let attempt = try await performWithRetryAttempt(
+                    W.self,
+                    request: try authorizedGET(url)
+                )
+                return (page, attempt.value, attempt.responseURL)
             }
         }
         // Keep a bounded window in flight - enough to saturate the network without
@@ -1697,18 +1774,18 @@ nonisolated func fetchKnownPages<W: PagedResponse>(
         while nextToFetch <= pageCount, nextToFetch - 2 < maxConcurrent {
             try enqueue(nextToFetch); nextToFetch += 1
         }
-        while let (page, response) = try await group.next() {
+        while let (page, response, responseURL) = try await group.next() {
             // Reject malformed speculative pages as soon as they finish. Waiting for a
             // missing earlier page used to retain invalid responses in `pending` and delay
             // the failure unnecessarily.
             try validateParallelIdentities(response)
-            pending[page] = response
+            pending[page] = (response, responseURL)
             // Emit a new snapshot whenever the contiguous prefix grows.
             var grew = false
             var reachedDeclaredEnd = false
             while let ready = pending.removeValue(forKey: nextToEmit) {
                 let added = Self.appendNew(
-                    ready.pageItems,
+                    ready.page.pageItems,
                     to: &collected,
                     seen: &seen,
                     identity: W.identity(of:),
@@ -1721,14 +1798,14 @@ nonisolated func fetchKnownPages<W: PagedResponse>(
                 // range, which is how an out-of-range request clamped to page one shows
                 // up here.
                 if nextToEmit == pageCount {
-                    let finalURL = pageURL(pageCount) ?? baseURL
+                    tailResponseURL = ready.responseURL
                     tailNextPage = try advancingTailNextPage(
-                        ready.nextPage,
+                        ready.page.nextPage,
                         afterEstimatedPage: pageCount,
                         pageAddedItems: added,
-                        relativeTo: finalURL
+                        relativeTo: ready.responseURL
                     )
-                } else if ready.nextPage == nil {
+                } else if ready.page.nextPage == nil {
                     // An ordered intermediate page is authoritative. Requests beyond it
                     // were speculative and their rows must not enter the result.
                     reachedDeclaredEnd = true
@@ -1752,7 +1829,7 @@ nonisolated func fetchKnownPages<W: PagedResponse>(
         }
     }
     items = collected
-    return tailNextPage
+    return (tailNextPage, tailResponseURL)
 }
 
 nonisolated func advancingTailNextPage(
@@ -1810,10 +1887,9 @@ nonisolated func walkNextPages<W: PagedResponse>(
     visitedPageURLs: inout Set<URL>,
     pagesAlreadyFetched: Int,
     deduplicate: Bool,
-    emit: ([W.Item]) -> Void
+    emit: @Sendable ([W.Item]) -> Void
 ) async throws {
-    var previousURL = startBase
-    var url = try start.flatMap { try validatedNextPageURL($0, relativeTo: previousURL) }
+    var url = try start.flatMap { try validatedNextPageURL($0, relativeTo: startBase) }
     var pagesFetched = pagesAlreadyFetched
     while let current = url {
         guard pagesFetched < maxSequentialPages else {
@@ -1823,7 +1899,11 @@ nonisolated func walkNextPages<W: PagedResponse>(
             throw errors.invalidRequest("Pagination next_page cycle detected")
         }
 
-        let page = try await performWithRetry(W.self, request: try authorizedGET(current))
+        let attempt = try await performWithRetryAttempt(
+            W.self,
+            request: try authorizedGET(current)
+        )
+        let page = attempt.value
         let added = Self.appendNew(
             page.pageItems,
             to: &items,
@@ -1842,9 +1922,8 @@ nonisolated func walkNextPages<W: PagedResponse>(
             throw errors.invalidRequest("Pagination exceeded \(maxSequentialPages) sequential pages")
         }
 
-        let nextURL = try validatedNextPageURL(next, relativeTo: current)
+        let nextURL = try validatedNextPageURL(next, relativeTo: attempt.responseURL)
         guard let nextURL else { break }
-        previousURL = current
         url = nextURL
     }
 }

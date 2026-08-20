@@ -152,45 +152,81 @@ public nonisolated enum RESTRequestError: Error, Equatable, Sendable {
 public nonisolated struct RESTResponse: Sendable {
     public var data: Data
     public var statusCode: Int
+    /// Final response URL after redirects, when supplied by the transport.
+    public var url: URL?
     /// Normalized response headers (lowercase names, first-wins for case variants).
     /// Assigning re-runs canonicalization so the normalized invariant cannot be broken.
     public var headers: [String: String] {
-        get { normalizedHeaders }
-        set { normalizedHeaders = Self.canonicalized(newValue) }
+        get { normalizedHeaderValues.mapValues { $0[0] } }
+        set { normalizedHeaderValues = Self.canonicalized(newValue) }
     }
 
-    private var normalizedHeaders: [String: String]
+    /// All values for each lowercase field name, preserving repeated fields.
+    public var headerValues: [String: [String]] {
+        get { normalizedHeaderValues }
+        set { normalizedHeaderValues = Self.canonicalized(newValue) }
+    }
 
-    public nonisolated init(data: Data, statusCode: Int, headers: [String: String] = [:]) {
+    private var normalizedHeaderValues: [String: [String]]
+
+    public nonisolated init(
+        data: Data,
+        statusCode: Int,
+        headers: [String: String] = [:],
+        url: URL? = nil
+    ) {
         precondition(
             (100 ... 599).contains(statusCode),
             "RESTResponse statusCode must be a valid HTTP status in 100...599"
         )
         self.data = data
         self.statusCode = statusCode
-        self.normalizedHeaders = Self.canonicalized(headers)
+        self.url = url
+        self.normalizedHeaderValues = Self.canonicalized(headers)
+    }
+
+    public nonisolated init(
+        data: Data,
+        statusCode: Int,
+        headerValues: [String: [String]],
+        url: URL? = nil
+    ) {
+        precondition(
+            (100 ... 599).contains(statusCode),
+            "RESTResponse statusCode must be a valid HTTP status in 100...599"
+        )
+        self.data = data
+        self.statusCode = statusCode
+        self.url = url
+        self.normalizedHeaderValues = Self.canonicalized(headerValues)
     }
 
     /// Returns a response header without requiring callers or transports to agree on
     /// capitalization (for example, `Retry-After` versus `retry-after`).
     public func value(forHTTPHeaderField field: String) -> String? {
-        // Storage is already lowercase; keep a case-insensitive fallback for safety.
-        if let exact = normalizedHeaders[field.lowercased()] {
-            return exact
-        }
-        return normalizedHeaders
-            .first { $0.key.compare(field, options: .caseInsensitive) == .orderedSame }?
-            .value
+        values(forHTTPHeaderField: field).first
     }
 
-    private static func canonicalized(_ headers: [String: String]) -> [String: String] {
+    public func values(forHTTPHeaderField field: String) -> [String] {
+        normalizedHeaderValues[field.lowercased()] ?? []
+    }
+
+    private static func canonicalized(_ headers: [String: String]) -> [String: [String]] {
         headers
             .sorted { $0.key.utf8.lexicographicallyPrecedes($1.key.utf8) }
             .reduce(into: [:]) { result, field in
                 let name = field.key.lowercased()
                 if result[name] == nil {
-                    result[name] = field.value
+                    result[name] = [field.value]
                 }
+            }
+    }
+
+    private static func canonicalized(_ headers: [String: [String]]) -> [String: [String]] {
+        headers
+            .sorted { $0.key.utf8.lexicographicallyPrecedes($1.key.utf8) }
+            .reduce(into: [:]) { result, field in
+                result[field.key.lowercased(), default: []].append(contentsOf: field.value)
             }
     }
 }
@@ -206,6 +242,8 @@ public nonisolated struct RESTResponse: Sendable {
 public protocol RESTTransport: Sendable {
     /// Execute a request while retaining its response body, status, and headers.
     nonisolated func response(for request: RESTRequest) async throws -> RESTResponse
+    /// Drains but does not retain successful response bytes. Error bytes are retained.
+    nonisolated func responseDiscardingSuccessBody(for request: RESTRequest) async throws -> RESTResponse
 }
 
 public extension RESTTransport {
@@ -213,6 +251,14 @@ public extension RESTTransport {
     nonisolated func data(for request: RESTRequest) async throws -> (Data, Int) {
         let response = try await response(for: request)
         return (response.data, response.statusCode)
+    }
+
+    nonisolated func responseDiscardingSuccessBody(for request: RESTRequest) async throws -> RESTResponse {
+        var response = try await response(for: request)
+        if (200 ..< 300).contains(response.statusCode) {
+            response.data.removeAll(keepingCapacity: false)
+        }
+        return response
     }
 }
 

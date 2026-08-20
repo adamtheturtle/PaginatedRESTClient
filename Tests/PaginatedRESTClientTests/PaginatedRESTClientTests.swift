@@ -715,6 +715,27 @@ struct PaginatedRESTClientTests {
     }
 
     @Test
+    func `streamAllPages does not start network work before iteration`() async throws {
+        let log = RequestLog()
+        let stream = makeClient(transport: ScriptedTransport(
+            pages: [[1, 2], [3, 4]],
+            total: 4,
+            outOfRange: .notFound,
+            log: log
+        )).streamAllPages(TenPerPage.self, path: "/things/")
+
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(log.requestedPages.isEmpty)
+
+        var snapshots: [[Thing]] = []
+        for try await snapshot in stream {
+            snapshots.append(snapshot)
+        }
+        #expect(!log.requestedPages.isEmpty)
+        #expect(snapshots.last == things(1 ... 4))
+    }
+
+    @Test
     func `a slow stream consumer retains only the newest cumulative snapshot`() async throws {
         let pages = stride(from: 1, through: 1_000, by: 10).map { Array($0 ... ($0 + 9)) }
         let log = RequestLog()
@@ -725,12 +746,19 @@ struct PaginatedRESTClientTests {
             log: log
         )).streamAllPages(TenPerPage.self, path: "/things/")
 
+        var iterator = stream.makeAsyncIterator()
+        var snapshots: [[Thing]] = []
+        if let first = try await iterator.next() {
+            snapshots.append(first)
+        }
         #expect(await waitUntil { log.requestedPages.count >= 100 })
         try await Task.sleep(for: .milliseconds(50))
-        var snapshots: [[Thing]] = []
-        for try await snapshot in stream { snapshots.append(snapshot) }
+        while let snapshot = try await iterator.next() {
+            snapshots.append(snapshot)
+        }
 
-        #expect(snapshots == [things(1 ... 1_000)])
+        #expect(snapshots.last == things(1 ... 1_000))
+        #expect(snapshots.count <= 3)
     }
 
     @Test
@@ -1306,16 +1334,16 @@ struct RateLimitRetryTests {
     @Test
     func `repeated rate limits cannot extend one cooldown past its cap`() {
         let cooldown = RateLimitCooldown()
-        let start = Date(timeIntervalSince1970: 0)
+        let start: TimeInterval = 0
         cooldown.extend(
-            until: start.addingTimeInterval(60),
+            until: start + 60,
             observedAt: start,
             maximumWindow: 60,
             for: "https://example.test:443"
         )
-        let later = start.addingTimeInterval(30)
+        let later = start + 30
         cooldown.extend(
-            until: later.addingTimeInterval(60),
+            until: later + 60,
             observedAt: later,
             maximumWindow: 60,
             for: "https://example.test:443"
