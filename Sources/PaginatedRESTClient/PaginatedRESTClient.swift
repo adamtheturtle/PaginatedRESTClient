@@ -336,8 +336,9 @@ public struct PaginatedRESTClient {
     nonisolated let maxAttempts: Int
 
     /// Upper bound on HTTP attempts across one paginated list (retries included) (#123).
-    /// Defaults to ``maxSequentialPages`` × ``maxAttempts`` so the page valves cannot be
-    /// amplified by the retry budget.
+    /// Defaults to ``maxSequentialPages`` × ``maxAttempts``. Parallel fetches also count
+    /// toward ``maxSequentialPages``, so that valve (not ``maxParallelPages`` alone) is
+    /// the page budget the retry multiplier must cover.
     public nonisolated let maxPaginationHTTPAttempts: Int
 
     // `nonisolated` so actors and background containers can construct the client
@@ -1659,6 +1660,10 @@ nonisolated func drivePagination<W: PagedResponse>(
         estimatedPageCount = Self.pageCount(total: total, pageSize: pageSize)
         guard estimatedPageCount <= maxParallelPages else {
             throw errors.invalidRequest("Pagination exceeded \(maxParallelPages) parallel pages")
+        }
+        // Parallel pages count toward the same total-page valve as the sequential tail.
+        guard estimatedPageCount <= maxSequentialPages else {
+            throw errors.invalidRequest("Pagination exceeded \(maxSequentialPages) total pages")
         }
     }
 
