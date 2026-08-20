@@ -194,10 +194,10 @@ final nonisolated class SameOriginRedirectDelegate: NSObject, URLSessionTaskDele
             completionHandler(.continueLoading, nil)
             return
         }
-        func validatedHandler(
-            _ disposition: URLSession.DelayedRequestDisposition,
-            _ newRequest: URLRequest?
-        ) {
+        let validatedHandler: @Sendable (
+            URLSession.DelayedRequestDisposition,
+            URLRequest?
+        ) -> Void = { [self] disposition, newRequest in
             switch disposition {
             case .useNewRequest:
                 guard let newRequest, allows(newRequest) else {
