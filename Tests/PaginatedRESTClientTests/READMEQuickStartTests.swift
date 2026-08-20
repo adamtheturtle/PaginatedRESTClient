@@ -43,7 +43,7 @@ private struct APIErrors: RESTTransportErrorMapping {
     }
 }
 
-private nonisolated struct READMEQuickStartTransport: RESTTransport {
+private nonisolated struct READMEQuickStartTransport: LegacyRESTTransport {
     func data(for _: RESTRequest) async throws -> (Data, Int) {
         let json = #"{"items":[{"id":1}],"next_page":null,"total":1}"#
         return (Data(json.utf8), 200)

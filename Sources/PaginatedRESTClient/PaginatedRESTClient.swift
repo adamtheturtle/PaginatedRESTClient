@@ -213,7 +213,16 @@ public struct PaginatedRESTClient {
 
     /// Retry delays, including server-provided `Retry-After` values, never block the
     /// shared client for longer than one minute.
-    nonisolated static let maxRetryDelay: TimeInterval = 60
+    public nonisolated static let defaultMaxRetryDelay: TimeInterval = 60
+
+    /// Default number of attempts for idempotent requests, including the first attempt.
+    public nonisolated static let defaultMaxAttempts = 3
+
+    /// Upper bound on retry delays, including server-provided `Retry-After` values.
+    nonisolated let maxRetryDelay: TimeInterval
+
+    /// Default number of attempts for idempotent requests, including the first attempt.
+    nonisolated let maxAttempts: Int
 
     // `nonisolated` so actors and background containers can construct the client
     // without hopping to MainActor; stored state is immutable and Sendable.
@@ -226,7 +235,9 @@ public struct PaginatedRESTClient {
         errors: any RESTTransportErrorMapping,
         log: @escaping @Sendable (String) -> Void = { _ in },
         maxSequentialPages: Int = Self.defaultMaxSequentialPages,
-        maxParallelPages: Int = Self.defaultMaxParallelPages
+        maxParallelPages: Int = Self.defaultMaxParallelPages,
+        maxRetryDelay: TimeInterval = Self.defaultMaxRetryDelay,
+        maxAttempts: Int = Self.defaultMaxAttempts
     ) {
         self.init(
             apiKey: apiKey,
@@ -238,7 +249,9 @@ public struct PaginatedRESTClient {
             log: log,
             retryRuntime: .live,
             maxSequentialPages: maxSequentialPages,
-            maxParallelPages: maxParallelPages
+            maxParallelPages: maxParallelPages,
+            maxRetryDelay: maxRetryDelay,
+            maxAttempts: maxAttempts
         )
     }
 
@@ -253,6 +266,8 @@ public struct PaginatedRESTClient {
         retryRuntime: RetryRuntime,
         maxSequentialPages: Int = Self.defaultMaxSequentialPages,
         maxParallelPages: Int = Self.defaultMaxParallelPages,
+        maxRetryDelay: TimeInterval = Self.defaultMaxRetryDelay,
+        maxAttempts: Int = Self.defaultMaxAttempts,
         rateLimitCooldown: RateLimitCooldown = RateLimitCooldown()
     ) {
         self.apiKey = Self.normalizedAPIKey(apiKey) ?? ""
@@ -266,6 +281,8 @@ public struct PaginatedRESTClient {
         self.retryRuntime = retryRuntime
         self.maxSequentialPages = max(1, maxSequentialPages)
         self.maxParallelPages = max(1, maxParallelPages)
+        self.maxRetryDelay = max(0, maxRetryDelay.isFinite ? maxRetryDelay : Self.defaultMaxRetryDelay)
+        self.maxAttempts = max(1, maxAttempts)
         self.rateLimitCooldown = rateLimitCooldown
     }
 
@@ -282,6 +299,8 @@ public struct PaginatedRESTClient {
             retryRuntime: retryRuntime,
             maxSequentialPages: maxSequentialPages,
             maxParallelPages: maxParallelPages,
+            maxRetryDelay: maxRetryDelay,
+            maxAttempts: maxAttempts,
             rateLimitCooldown: RateLimitCooldown()
         )
     }
@@ -299,14 +318,23 @@ public struct PaginatedRESTClient {
             retryRuntime: retryRuntime,
             maxSequentialPages: maxSequentialPages,
             maxParallelPages: maxParallelPages,
+            maxRetryDelay: maxRetryDelay,
+            maxAttempts: maxAttempts,
             rateLimitCooldown: other.rateLimitCooldown
         )
     }
 
-    public nonisolated func fetch<T: Decodable & Sendable>(_ type: T.Type, path: String) async throws -> T {
+    public nonisolated func fetch<T: Decodable & Sendable>(
+        _ type: T.Type,
+        path: String,
+        headers: [String: String] = [:]
+    ) async throws -> T {
         guard !apiKey.isEmpty else { throw errors.missingAPIKey() }
 
-        return try await performWithRetry(type, request: try authorizedGET(baseURL.appending(path: path)))
+        return try await performWithRetry(
+            type,
+            request: try authorizedGET(try url(forPath: path), headers: headers)
+        )
     }
 
     /// Accumulates every page of a paginated list endpoint. Convenience over
@@ -373,13 +401,14 @@ public struct PaginatedRESTClient {
     public nonisolated func performWithRetry<T: Decodable & Sendable>(
         _ type: T.Type,
         request: RESTRequest,
-        maxAttempts: Int = 3
+        maxAttempts: Int? = nil
     ) async throws -> T {
-        guard maxAttempts > 0 else { throw errors.decode("maxAttempts must be positive") }
+        let attempts = maxAttempts ?? self.maxAttempts
+        guard attempts > 0 else { throw errors.decode("maxAttempts must be positive") }
         guard Self.methodIsIdempotent(request.method) else {
             return try await perform(type, request: request)
         }
-        let attempts = request.bodyFileURL == nil ? maxAttempts : 1
+        let retryAttempts = request.bodyFileURL == nil ? attempts : 1
 
         var attempt = 0
         while true {
@@ -389,7 +418,8 @@ public struct PaginatedRESTClient {
                 attempt += 1
 
                 if failure.response.statusCode == 429 {
-                    guard attempt < attempts, errors.isTransient(failure.mappedError) else {
+                    guard attempt < retryAttempts, errors.isTransient(failure.mappedError) else {
+                        observeRateLimitCooldown(from: failure.response)
                         throw failure.mappedError
                     }
                     let now = retryRuntime.now()
@@ -397,20 +427,20 @@ public struct PaginatedRESTClient {
                         failure.response.value(forHTTPHeaderField: "Retry-After"),
                         relativeTo: now
                     )
-                    let delay = min(Self.maxRetryDelay, retryAfter ?? Self.rateLimitFallbackDelay(
+                    let delay = min(maxRetryDelay, retryAfter ?? Self.rateLimitFallbackDelay(
                         retryNumber: attempt,
                         jitter: retryRuntime.jitter()
                     ))
                     rateLimitCooldown.extend(until: now.addingTimeInterval(delay))
                     emitLog(
-                        "Rate limited; retry \(attempt)/\(attempts - 1) "
+                        "Rate limited; retry \(attempt)/\(retryAttempts - 1) "
                             + "after shared \(String(format: "%.3f", delay))s cooldown"
                     )
                     try await waitForRateLimitCooldown()
                     continue
                 }
 
-                guard attempt < attempts, errors.isTransient(failure.mappedError) else {
+                guard attempt < retryAttempts, errors.isTransient(failure.mappedError) else {
                     throw failure.mappedError
                 }
 
@@ -419,29 +449,29 @@ public struct PaginatedRESTClient {
                        failure.response.value(forHTTPHeaderField: "Retry-After"),
                        relativeTo: retryRuntime.now()
                    ) {
-                    let delay = min(Self.maxRetryDelay, retryAfter)
+                    let delay = min(maxRetryDelay, retryAfter)
                     emitLog(
-                        "Transient failure; retry \(attempt)/\(attempts - 1) "
+                        "Transient failure; retry \(attempt)/\(retryAttempts - 1) "
                             + "after \(String(format: "%.3f", delay))s Retry-After"
                     )
                     try await retryRuntime.sleep(delay)
                     continue
                 }
 
-                emitLog("Transient failure; retry \(attempt)/\(attempts - 1)")
-                try await retryRuntime.sleep(Self.retryBackoffDelay(retryNumber: attempt))
+                emitLog("Transient failure; retry \(attempt)/\(retryAttempts - 1)")
+                try await retryRuntime.sleep(retryBackoffDelay(retryNumber: attempt))
             } catch is CancellationError {
                 throw CancellationError()
             } catch let bodyError as RESTRequestBodyError {
                 throw mappedBodyError(bodyError)
             } catch {
                 attempt += 1
-                guard attempt < attempts, errors.isTransient(error) else { throw error }
+                guard attempt < retryAttempts, errors.isTransient(error) else { throw error }
 
-                emitLog("Transient failure; retry \(attempt)/\(attempts - 1)")
+                emitLog("Transient failure; retry \(attempt)/\(retryAttempts - 1)")
                 // Preserve the existing 300ms, then 600ms exponential policy for
                 // non-HTTP transient errors. The injected sleep remains cancellable.
-                try await retryRuntime.sleep(Self.retryBackoffDelay(retryNumber: attempt))
+                try await retryRuntime.sleep(retryBackoffDelay(retryNumber: attempt))
             }
         }
     }
@@ -462,6 +492,44 @@ public struct PaginatedRESTClient {
         body: some Encodable
     ) async throws {
         try await performNoContent(request: try makeSendRequest(method: method, path: path, body: body))
+    }
+
+    /// Sends an authenticated request without a body.
+    public nonisolated func send<T: Decodable & Sendable>(
+        _ type: T.Type,
+        method: String,
+        path: String
+    ) async throws -> T {
+        try await perform(type, request: try authorizedRequest(method: method, path: path))
+    }
+
+    /// Sends an authenticated request without a body when the response has no model.
+    public nonisolated func send(method: String, path: String) async throws {
+        try await performNoContent(request: try authorizedRequest(method: method, path: path))
+    }
+
+    /// Sends an authenticated request whose body is streamed from a local file.
+    public nonisolated func send<T: Decodable & Sendable>(
+        _ type: T.Type,
+        method: String,
+        path: String,
+        bodyFileURL: URL
+    ) async throws -> T {
+        try await perform(
+            type,
+            request: try authorizedRequest(method: method, path: path, bodyFileURL: bodyFileURL)
+        )
+    }
+
+    /// Sends an authenticated file-backed request when the response has no model.
+    public nonisolated func send(
+        method: String,
+        path: String,
+        bodyFileURL: URL
+    ) async throws {
+        try await performNoContent(
+            request: try authorizedRequest(method: method, path: path, bodyFileURL: bodyFileURL)
+        )
     }
 
     public nonisolated func perform<T: Decodable & Sendable>(
@@ -514,6 +582,7 @@ public struct PaginatedRESTClient {
     }
 
     private nonisolated func transportResponse(for request: RESTRequest) async throws -> RESTResponse {
+        try request.validate()
         try await waitForRateLimitCooldown()
         try Task.checkCancellation()
 
@@ -565,7 +634,7 @@ public struct PaginatedRESTClient {
             relativeTo: now
         )
         let delay = min(
-            Self.maxRetryDelay,
+            maxRetryDelay,
             retryAfter ?? Self.rateLimitFallbackDelay(retryNumber: 1, jitter: retryRuntime.jitter())
         )
         rateLimitCooldown.extend(until: now.addingTimeInterval(delay))
@@ -586,7 +655,6 @@ public struct PaginatedRESTClient {
                 "send requires a method that allows a JSON body; use fetch for GET/HEAD"
             )
         }
-        let url = try validatedAuthenticatedURL(baseURL.appending(path: path))
         let encoded: Data
         do {
             encoded = try encoderFactory().encode(body)
@@ -595,14 +663,10 @@ public struct PaginatedRESTClient {
         } catch {
             throw errors.encode(Self.boundedEncodeDetail(error))
         }
-        return RESTRequest(
-            url: url,
+        return try authorizedRequest(
             method: method,
-            headers: [
-                "Authorization": "Bearer \(apiKey)",
-                "Accept": "application/json",
-                "Content-Type": "application/json"
-            ],
+            path: path,
+            headers: ["Content-Type": "application/json"],
             body: encoded
         )
     }
@@ -778,7 +842,7 @@ extension PaginatedRESTClient {
 
     nonisolated static func retryBackoffDelay(retryNumber: Int) -> TimeInterval {
         let exponent = Double(min(max(retryNumber - 1, 0), 10))
-        return min(maxRetryDelay, 0.3 * pow(2, exponent))
+        return min(defaultMaxRetryDelay, 0.3 * pow(2, exponent))
     }
 
     nonisolated static func methodIsIdempotent(_ method: String) -> Bool {
@@ -799,19 +863,67 @@ extension PaginatedRESTClient {
         default: true
         }
     }
+
+    private nonisolated func retryBackoffDelay(retryNumber: Int) -> TimeInterval {
+        let exponent = Double(min(max(retryNumber - 1, 0), 10))
+        return min(maxRetryDelay, 0.3 * pow(2, exponent))
+    }
 }
 
 public extension PaginatedRESTClient {
+    /// Builds an authenticated request for a path on the configured origin. Callers can
+    /// supply raw or file-backed bodies without exposing the bearer credential to another
+    /// origin. The generated authorization header always replaces a caller-supplied one.
+    nonisolated func authorizedRequest(
+        method: String,
+        path: String,
+        headers: [String: String] = [:],
+        body: Data? = nil,
+        bodyFileURL: URL? = nil
+    ) throws -> RESTRequest {
+        guard !apiKey.isEmpty else { throw errors.missingAPIKey() }
+        let url = try validatedAuthenticatedURL(try url(forPath: path))
+        var authenticatedHeaders = headers.filter {
+            $0.key.compare("Authorization", options: .caseInsensitive) != .orderedSame
+        }
+        if !authenticatedHeaders.keys.contains(where: {
+            $0.compare("Accept", options: .caseInsensitive) == .orderedSame
+        }) {
+            authenticatedHeaders["Accept"] = "application/json"
+        }
+        authenticatedHeaders["Authorization"] = "Bearer \(apiKey)"
+        let request = RESTRequest(
+            url: url,
+            method: method,
+            headers: authenticatedHeaders,
+            body: body,
+            bodyFileURL: bodyFileURL
+        )
+        try request.validate()
+        return request
+    }
+
     /// Builds an authenticated GET only for the configured origin. This method throws
     /// rather than placing bearer credentials on an arbitrary caller-provided URL.
-    nonisolated func authorizedGET(_ url: URL) throws -> RESTRequest {
+    nonisolated func authorizedGET(_ url: URL, headers: [String: String] = [:]) throws -> RESTRequest {
         guard !apiKey.isEmpty else { throw errors.missingAPIKey() }
         let validated = try validatedAuthenticatedURL(url)
-        return RESTRequest(
+        var authenticatedHeaders = headers.filter {
+            $0.key.compare("Authorization", options: .caseInsensitive) != .orderedSame
+        }
+        if !authenticatedHeaders.keys.contains(where: {
+            $0.compare("Accept", options: .caseInsensitive) == .orderedSame
+        }) {
+            authenticatedHeaders["Accept"] = "application/json"
+        }
+        authenticatedHeaders["Authorization"] = "Bearer \(apiKey)"
+        let request = RESTRequest(
             url: validated,
             method: "GET",
-            headers: ["Authorization": "Bearer \(apiKey)", "Accept": "application/json"]
+            headers: authenticatedHeaders
         )
+        try request.validate()
+        return request
     }
 
     /// Validates that `url` stays on the configured HTTP(S) origin without URL userinfo,
@@ -824,6 +936,30 @@ public extension PaginatedRESTClient {
         else {
             throw errors.invalidRequest("Authenticated URL left the configured origin")
         }
+        return url
+    }
+
+    /// Resolves the public `path` argument as a path reference, preserving the configured
+    /// base URL unchanged for an empty reference and merging a supplied query separately.
+    /// `URL.appending(path:)` cannot do this because it percent-encodes `?` as path data.
+    nonisolated func url(forPath path: String) throws -> URL {
+        guard !path.isEmpty else { return baseURL }
+        guard let reference = URLComponents(string: path),
+              reference.scheme == nil,
+              reference.host == nil,
+              reference.user == nil,
+              reference.password == nil
+        else {
+            throw errors.invalidRequest("Path must be a relative path reference")
+        }
+        let appended = baseURL.appending(path: reference.path)
+        guard var components = URLComponents(url: appended, resolvingAgainstBaseURL: false) else {
+            throw errors.invalidRequest("Invalid URL")
+        }
+        components.queryItems = (components.queryItems ?? []) + (reference.queryItems ?? [])
+        // A fragment is never sent over HTTP and must not silently alter URL construction.
+        components.fragment = nil
+        guard let url = components.url else { throw errors.invalidRequest("Invalid URL") }
         return url
     }
 
@@ -915,7 +1051,8 @@ nonisolated func drivePagination<W: PagedResponse>(
     /// removed for the first request) so parallel numbering always treats the
     /// first response as page 1.
     func pageURL(_ page: Int?) -> URL? {
-        var comps = URLComponents(url: baseURL.appending(path: path), resolvingAgainstBaseURL: false)
+        guard let endpoint = try? url(forPath: path) else { return nil }
+        var comps = URLComponents(url: endpoint, resolvingAgainstBaseURL: false)
         var query = comps?.queryItems ?? []
         if let sort {
             query.removeAll { $0.name.compare("sort", options: .caseInsensitive) == .orderedSame }
@@ -1091,11 +1228,14 @@ nonisolated func fetchKnownPages<W: PagedResponse>(
             try enqueue(nextToFetch); nextToFetch += 1
         }
         while let (page, response) = try await group.next() {
+            // Reject malformed speculative pages as soon as they finish. Waiting for a
+            // missing earlier page used to retain invalid responses in `pending` and delay
+            // the failure unnecessarily.
+            try validateParallelIdentities(response)
             pending[page] = response
             // Emit a new snapshot whenever the contiguous prefix grows.
             var grew = false
             while let ready = pending.removeValue(forKey: nextToEmit) {
-                try validateParallelIdentities(ready)
                 let added = Self.appendNew(
                     ready.pageItems,
                     to: &collected,

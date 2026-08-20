@@ -1,4 +1,4 @@
-import PaginatedRESTClient
+@testable import PaginatedRESTClient
 import Foundation
 import Synchronization
 import Testing
@@ -9,6 +9,16 @@ import Testing
 
 @Suite("URLSession transport response limits")
 struct URLSessionTransportTests {
+    @Test
+    func `default transport uses an isolated ephemeral session`() {
+        let transport = URLSessionTransport()
+        #expect(transport.session.configuration.urlCache !== URLSession.shared.configuration.urlCache)
+        #expect(
+            transport.session.configuration.httpCookieStorage
+                !== URLSession.shared.configuration.httpCookieStorage
+        )
+    }
+
     @Test
     func `a file-backed request body is delivered through a stream`() async throws {
         let body = Data(repeating: 0xA5, count: 2 * 1024 * 1024)
@@ -50,6 +60,28 @@ struct URLSessionTransportTests {
         }
     }
 
+    @Test
+    func `a directory is rejected as a file-backed request body`() async throws {
+        let request = RESTRequest(
+            url: try #require(URL(string: "https://example.test/upload")),
+            method: "POST",
+            bodyFileURL: FileManager.default.temporaryDirectory
+        )
+
+        await #expect(throws: RESTRequestBodyError.unreadableBodyFile(
+            FileManager.default.temporaryDirectory
+        )) {
+            _ = try await URLSessionTransport().response(for: request)
+        }
+    }
+
+    @Test
+    func `negative response limits clamp to zero without crashing`() {
+        let transport = URLSessionTransport(successResponseLimit: -1, errorResponseLimit: -2)
+        #expect(transport.successResponseLimit == 0)
+        #expect(transport.errorResponseLimit == 0)
+    }
+
     @Test(arguments: [(200, 8, 64), (500, 64, 8)])
     func `success and error bodies use separate streaming limits`(
         status: Int,
@@ -75,6 +107,21 @@ struct URLSessionTransportTests {
         // Apple streams byte-by-byte so rejection lands at exactly `limit`; Linux may
         // receive a larger first chunk and reject with zero accepted bytes.
         #expect((error?.observedByteCount ?? -1) <= 8)
+    }
+
+    @Test
+    func `HEAD ignores representation Content-Length when no bytes arrive`() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [HeadContentLengthURLProtocol.self]
+        let transport = URLSessionTransport(
+            session: URLSession(configuration: configuration),
+            successResponseLimit: 1
+        )
+        let request = RESTRequest(url: try #require(URL(string: "https://example.test/head")), method: "HEAD")
+
+        let response = try await transport.response(for: request)
+        #expect(response.statusCode == 200)
+        #expect(response.data.isEmpty)
     }
 
     @Test
@@ -299,6 +346,29 @@ private final nonisolated class ResponseLimitURLProtocol: URLProtocol {
         }
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: Data(repeating: 97, count: 32))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+private final nonisolated class HeadContentLengthURLProtocol: URLProtocol {
+    override static func canInit(with _: URLRequest) -> Bool { true }
+    override static func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let url = request.url,
+              let response = HTTPURLResponse(
+                  url: url,
+                  statusCode: 200,
+                  httpVersion: "HTTP/1.1",
+                  headerFields: ["Content-Length": "1000000"]
+              )
+        else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocolDidFinishLoading(self)
     }
 

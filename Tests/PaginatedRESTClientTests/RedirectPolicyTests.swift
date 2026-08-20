@@ -56,6 +56,18 @@ struct RedirectPolicyTests {
     }
 
     @Test
+    func `equivalent IPv6 literals define the same authenticated origin`() {
+        #expect(SameOriginRedirectDelegate.hasSameOrigin(
+            URL(string: "https://[::1]/resources")!,
+            URL(string: "https://[0:0:0:0:0:0:0:1]:443/other")!
+        ))
+        #expect(!SameOriginRedirectDelegate.hasSameOrigin(
+            URL(string: "https://[::1]/resources")!,
+            URL(string: "https://[::2]/resources")!
+        ))
+    }
+
+    @Test
     func `file-backed bodies can provide a fresh stream`() throws {
         let expected = Data("stream me again".utf8)
         let bodyFileURL = FileManager.default.temporaryDirectory

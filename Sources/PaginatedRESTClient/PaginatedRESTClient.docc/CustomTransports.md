@@ -4,16 +4,16 @@
 
 ```swift
 public protocol RESTTransport: Sendable {
-    func data(for request: RESTRequest) async throws -> (Data, Int)
     func response(for request: RESTRequest) async throws -> RESTResponse
 }
 ```
 
 A transport executes a ``RESTRequest`` and returns the response body, HTTP status code, and
 headers. The paginator uses `Retry-After` to coordinate rate-limit cooldowns across concurrent
-page requests. Existing transports only need `data(for:)`: the protocol supplies a compatible
-`response(for:)` with empty headers, although those transports cannot honor `Retry-After` until
-they implement the header-aware method.
+page requests. Implement `response(for:)` directly for every new transport. The convenience
+`data(for:)` projection remains available when a caller does not need headers. Legacy transports
+can temporarily conform to `LegacyRESTTransport`, whose one-way adapter supplies
+an empty header collection.
 
 That's the whole contract - **no decoding, no retry, no auth.** All of that stays in the
 paginator, so a transport is a thin translation from ``RESTRequest`` to whatever your HTTP
@@ -51,24 +51,24 @@ import PaginatedRESTClient
 struct GetTransport: RESTTransport {
     let client: APIClient
 
-    func data(for request: RESTRequest) async throws -> (Data, Int) {
-        let response = try await response(for: request)
-        return (response.data, response.statusCode)
-    }
-
     func response(for request: RESTRequest) async throws -> RESTResponse {
-        var get = Request<Data>(
+        var get = Request<Void>(
             url: request.url,
             method: HTTPMethod(rawValue: request.method)
         )
         get.headers = request.headers
-        // GET pagination is bodyless; pass raw bytes through for mutating requests.
-        if let body = request.body {
-            get.body = body
-        }
 
         do {
-            let response = try await client.data(for: get)
+            let response: Response<Data>
+            if let body = request.body {
+                // `Request.body` is JSON-encoded by Get. Use its upload API so the
+                // already encoded RESTRequest bytes stay unchanged.
+                response = try await client.upload(for: get, from: body)
+            } else if let bodyFileURL = request.bodyFileURL {
+                response = try await client.upload(for: get, fromFile: bodyFileURL)
+            } else {
+                response = try await client.data(for: get)
+            }
             guard let http = response.response as? HTTPURLResponse else {
                 throw URLError(.badServerResponse)
             }
@@ -93,9 +93,9 @@ struct GetTransport: RESTTransport {
 // let client = PaginatedRESTClient(apiKey: token, baseURL: base, transport: transport, …)
 ```
 
-> Get's `Request.body` is `Encodable`. Wrapping it in a `Data`-carrying box (so already
-> encoded bytes pass through untouched) is left to the caller; for plain paginated GETs the
-> body is always `nil` and this never comes up.
+> Get validates non-2xx responses through its `APIClientDelegate` by default. Configure a
+> delegate that permits HTTP responses so this adapter can return their status and body to the
+> paginator's error mapping.
 
 ## Alamofire
 
@@ -112,11 +112,6 @@ import PaginatedRESTClient
 /// A `RESTTransport` backed by an Alamofire `Session`.
 struct AlamofireTransport: RESTTransport {
     let session: Session
-
-    func data(for request: RESTRequest) async throws -> (Data, Int) {
-        let response = try await response(for: request)
-        return (response.data, response.statusCode)
-    }
 
     func response(for request: RESTRequest) async throws -> RESTResponse {
         var urlRequest = URLRequest(url: request.url)

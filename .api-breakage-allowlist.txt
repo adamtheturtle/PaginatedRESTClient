@@ -29,3 +29,7 @@ API breakage: func PaginatedRESTClient.honorsRetryAfter(statusCode:) has been ad
 API breakage: var PaginatedRESTClient.maxRetryDelay has been added as a static property
 API breakage: func RESTTransportErrorMapping.invalidRequest(_:) has been added as a default implementation
 API breakage: func RESTTransportErrorMapping.encode(_:) has been added as a default implementation
+API breakage: func PaginatedRESTClient.performWithRetry(_:request:maxAttempts:) has parameter 2 type change from Swift.Int to Swift.Int?
+API breakage: func PaginatedRESTClient.fetch(_:path:) has been renamed to func fetch(_:path:headers:)
+API breakage: func PaginatedRESTClient.authorizedGET(_:) has been renamed to func authorizedGET(_:headers:)
+API breakage: func RESTTransport.response(for:) has been removed

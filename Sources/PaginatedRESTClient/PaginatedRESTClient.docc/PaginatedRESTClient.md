@@ -11,7 +11,9 @@ retry backoff, JSON decoding, and item de-duplication.
 
 Use the default ``URLSessionTransport`` for Foundation-only networking, or provide a custom
 ``RESTTransport`` adapter for another HTTP client. See <doc:CustomTransports> for Get and
-Alamofire examples.
+Alamofire examples. The default transport owns an ephemeral session, so it does not share
+the app's cookies or response cache. Pass a configured `URLSession` when shared state is
+intentional.
 
 ### Response body limits
 
@@ -23,6 +25,15 @@ the HTTP status as headers arrive. Exceeding the limit throws ``RESTResponseTooL
 ``RESTTransportErrorMapping/http(status:body:)`` so large 4xx/5xx responses keep their HTTP
 classification. Pass custom `successResponseLimit` and `errorResponseLimit` values to
 ``URLSessionTransport`` when you need different ceilings.
+
+### Retry policy
+
+Idempotent requests retry up to three times by default. Pass `maxAttempts` to
+``PaginatedRESTClient/init(apiKey:baseURL:transport:decoderFactory:encoderFactory:errors:log:maxSequentialPages:maxParallelPages:maxRetryDelay:maxAttempts:)``
+to change that default for ``PaginatedRESTClient/fetch(_:path:)``, pagination, and
+``PaginatedRESTClient/performWithRetry(_:request:maxAttempts:)``. Retry delays cap at 60
+seconds by default; configure `maxRetryDelay` when an API's `Retry-After` requires a longer
+cooldown.
 
 ### Pagination ceilings
 

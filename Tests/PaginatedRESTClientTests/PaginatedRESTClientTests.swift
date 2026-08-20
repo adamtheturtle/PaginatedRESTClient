@@ -198,7 +198,7 @@ private nonisolated final class RequestLog: @unchecked Sendable {
 
 /// Serves a list defined by `pages` (page 1 first) and a policy for pages past the end,
 /// so each regression test can describe the server behaviour it needs.
-private nonisolated struct ScriptedTransport: RESTTransport {
+private nonisolated struct ScriptedTransport: LegacyRESTTransport {
     /// How the server treats a `page` beyond the last real page.
     enum OutOfRange: Sendable {
         /// 404 - not classified as transient, so it fails the whole load.
@@ -238,7 +238,7 @@ private nonisolated struct ScriptedTransport: RESTTransport {
 }
 
 /// Serves a single first page verbatim, for the `total`-validation tests.
-private nonisolated struct FixedFirstPageTransport: RESTTransport {
+private nonisolated struct FixedFirstPageTransport: LegacyRESTTransport {
     let json: String
 
     func data(for _: RESTRequest) async throws -> (Data, Int) {
@@ -262,7 +262,7 @@ private nonisolated final class CapturedRequests: @unchecked Sendable {
     }
 }
 
-private nonisolated struct NextPageTransport: RESTTransport {
+private nonisolated struct NextPageTransport: LegacyRESTTransport {
     let nextPage: String
     let laterNextPage: String?
     let captured: CapturedRequests
@@ -289,7 +289,7 @@ private nonisolated struct NextPageTransport: RESTTransport {
     }
 }
 
-private nonisolated struct CycleTransport: RESTTransport {
+private nonisolated struct CycleTransport: LegacyRESTTransport {
     enum Kind: Sendable {
         case selfLoop
         case twoPages
@@ -322,7 +322,7 @@ private nonisolated struct CycleTransport: RESTTransport {
 /// networking - a `RESTTransport` stub in place of the old `URLProtocol`/`URLSession`
 /// machinery, so the tests exercise the paginator over the same seam consumers use and
 /// stay Foundation-only (Linux-clean).
-private struct StubTransport: RESTTransport {
+private struct StubTransport: LegacyRESTTransport {
     func data(for request: RESTRequest) async throws -> (Data, Int) {
         let page = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?
             .queryItems?.first { $0.name == "page" }?.value
@@ -338,7 +338,7 @@ private struct StubTransport: RESTTransport {
     }
 }
 
-private nonisolated struct QueryCaptureTransport: RESTTransport {
+private nonisolated struct QueryCaptureTransport: LegacyRESTTransport {
     let captured: CapturedRequests
 
     func data(for request: RESTRequest) async throws -> (Data, Int) {
@@ -347,12 +347,19 @@ private nonisolated struct QueryCaptureTransport: RESTTransport {
     }
 }
 
-private nonisolated struct FixedResponseTransport: RESTTransport {
+private nonisolated struct FixedResponseTransport: LegacyRESTTransport {
     let data: Data
     let status: Int
 
     func data(for _: RESTRequest) async throws -> (Data, Int) {
         (data, status)
+    }
+}
+
+/// A modern transport needs only the header-aware requirement.
+private nonisolated struct ResponseOnlyTransport: RESTTransport {
+    func response(for _: RESTRequest) async throws -> RESTResponse {
+        RESTResponse(data: Data(#"{"id":1}"#.utf8), statusCode: 200, headers: ["X-Source": "modern"])
     }
 }
 
@@ -403,9 +410,23 @@ private nonisolated final class ControlledSleeper: @unchecked Sendable {
     }
 }
 
+/// Bounds cooperative test polling so a regression fails instead of hanging the suite.
+private nonisolated func waitUntil(
+    timeout: Duration = .seconds(1),
+    condition: @escaping @Sendable () -> Bool
+) async -> Bool {
+    let clock = ContinuousClock()
+    let deadline = clock.now + timeout
+    while !condition() {
+        guard clock.now < deadline else { return false }
+        await Task.yield()
+    }
+    return true
+}
+
 /// Returns one rate limit response followed by a success, retaining mixed-case headers
 /// to exercise the header-aware transport path and case-insensitive lookup together.
-private nonisolated final class RetryOnceTransport: RESTTransport, @unchecked Sendable {
+private nonisolated final class RetryOnceTransport: LegacyRESTTransport, @unchecked Sendable {
     private let lock = NSLock()
     private var attempts = 0
     let retryAfter: String?
@@ -441,7 +462,7 @@ private nonisolated final class RetryOnceTransport: RESTTransport, @unchecked Se
     }
 }
 
-private nonisolated final class CountingStatusTransport: RESTTransport, @unchecked Sendable {
+private nonisolated final class CountingStatusTransport: LegacyRESTTransport, @unchecked Sendable {
     private let lock = NSLock()
     private var attempts = 0
     let status: Int
@@ -459,7 +480,7 @@ private nonisolated final class CountingStatusTransport: RESTTransport, @uncheck
     var requestCount: Int { lock.withLock { attempts } }
 }
 
-private nonisolated final class TerminalRateLimitTransport: RESTTransport, @unchecked Sendable {
+private nonisolated final class TerminalRateLimitTransport: LegacyRESTTransport, @unchecked Sendable {
     private let lock = NSLock()
     private var paths: [String] = []
 
@@ -487,7 +508,7 @@ private nonisolated final class TerminalRateLimitTransport: RESTTransport, @unch
 
 /// Makes pages 2 and 3 reach their first 429 together, then serves both successfully.
 /// The barrier prevents scheduler order from weakening the shared-cooldown assertion.
-private nonisolated final class ConcurrentRateLimitTransport: RESTTransport, @unchecked Sendable {
+private nonisolated final class ConcurrentRateLimitTransport: LegacyRESTTransport, @unchecked Sendable {
     private let lock = NSLock()
     private var attempts: [Int: Int] = [:]
     private var rateLimited: [CheckedContinuation<RESTResponse, Never>] = []
@@ -544,7 +565,9 @@ private func makeClient(
     baseURL: URL = URL(string: "https://example.test")!,
     retryRuntime: RetryRuntime = .live,
     maxSequentialPages: Int = PaginatedRESTClient.defaultMaxSequentialPages,
-    maxParallelPages: Int = PaginatedRESTClient.defaultMaxParallelPages
+    maxParallelPages: Int = PaginatedRESTClient.defaultMaxParallelPages,
+    maxRetryDelay: TimeInterval = PaginatedRESTClient.defaultMaxRetryDelay,
+    maxAttempts: Int = PaginatedRESTClient.defaultMaxAttempts
 ) -> PaginatedRESTClient {
     PaginatedRESTClient(
         apiKey: "test-key",
@@ -555,7 +578,9 @@ private func makeClient(
         errors: TestErrors(),
         retryRuntime: retryRuntime,
         maxSequentialPages: maxSequentialPages,
-        maxParallelPages: maxParallelPages
+        maxParallelPages: maxParallelPages,
+        maxRetryDelay: maxRetryDelay,
+        maxAttempts: maxAttempts
     )
 }
 
@@ -563,6 +588,13 @@ private func makeClient(
 
 @Suite("PaginatedRESTClient")
 struct PaginatedRESTClientTests {
+    @Test
+    func `a header-aware transport conforms without a legacy data method`() async throws {
+        let client = makeClient(transport: ResponseOnlyTransport())
+        let value = try await client.fetch(Thing.self, path: "/value")
+        #expect(value == Thing(id: 1))
+    }
+
     @Test
     func `custom decoding failures use the configured mapping`() async throws {
         let client = PaginatedRESTClient(
@@ -652,7 +684,7 @@ struct PaginatedRESTClientTests {
             log: log
         )).streamAllPages(TenPerPage.self, path: "/things/")
 
-        while log.requestedPages.count < 100 { await Task.yield() }
+        #expect(await waitUntil { log.requestedPages.count >= 100 })
         try await Task.sleep(for: .milliseconds(50))
         var snapshots: [[Thing]] = []
         for try await snapshot in stream { snapshots.append(snapshot) }
@@ -866,7 +898,7 @@ extension PaginatedRESTClientTests {
 
     @Test
     func `a non-2xx status surfaces as a mapped HTTP error`() async throws {
-        struct FailingTransport: RESTTransport {
+        struct FailingTransport: LegacyRESTTransport {
             func data(for _: RESTRequest) async throws -> (Data, Int) {
                 (Data("nope".utf8), 404)
             }
@@ -982,7 +1014,7 @@ struct RateLimitRetryTests {
         let request = try client.authorizedGET(#require(URL(string: "https://example.test/things/1")))
         let task = Task { try await client.performWithRetry(Thing.self, request: request) }
 
-        while sleeper.requestedDelays.isEmpty { await Task.yield() }
+        #expect(await waitUntil { !sleeper.requestedDelays.isEmpty })
         #expect(sleeper.requestedDelays == [7])
         #expect(transport.requestCount == 1)
         clock.advance(by: 7)
@@ -1008,7 +1040,7 @@ struct RateLimitRetryTests {
         let request = try client.authorizedGET(#require(URL(string: "https://example.test/things/1")))
         let task = Task { try await client.performWithRetry(Thing.self, request: request) }
 
-        while sleeper.requestedDelays.isEmpty { await Task.yield() }
+        #expect(await waitUntil { !sleeper.requestedDelays.isEmpty })
         #expect(sleeper.requestedDelays == [1.125])
         clock.advance(by: 1.125)
         sleeper.resumeAll()
@@ -1033,7 +1065,7 @@ struct RateLimitRetryTests {
         let request = try client.authorizedGET(try #require(URL(string: "https://example.test/things/1")))
         let task = Task { try await client.performWithRetry(Thing.self, request: request) }
 
-        while sleeper.requestedDelays.isEmpty { await Task.yield() }
+        #expect(await waitUntil { !sleeper.requestedDelays.isEmpty })
         #expect(sleeper.requestedDelays == [60])
         clock.advance(by: 60)
         sleeper.resumeAll()
@@ -1042,7 +1074,42 @@ struct RateLimitRetryTests {
     }
 
     @Test
-    func `a terminal rate limit does not delay a later request`() async throws {
+    func `client max retry delay honors longer Retry-After values`() async throws {
+        let clock = TestClock()
+        let sleeper = ControlledSleeper()
+        let transport = RetryOnceTransport(retryAfter: "90")
+        let client = makeClient(
+            transport: transport,
+            retryRuntime: RetryRuntime(
+                now: { clock.now },
+                sleep: { try await sleeper.sleep(for: $0) },
+                jitter: { 0 }
+            ),
+            maxRetryDelay: 120
+        )
+        let request = try client.authorizedGET(#require(URL(string: "https://example.test/things/1")))
+        let task = Task { try await client.performWithRetry(Thing.self, request: request) }
+
+        #expect(await waitUntil { !sleeper.requestedDelays.isEmpty })
+        #expect(sleeper.requestedDelays == [90])
+        clock.advance(by: 90)
+        sleeper.resumeAll()
+        #expect(try await task.value == Thing(id: 1))
+    }
+
+    @Test
+    func `client default max attempts applies to fetch retries`() async throws {
+        let transport = CountingStatusTransport(status: 500)
+        let client = makeClient(transport: transport, maxAttempts: 1)
+
+        await #expect(throws: TestErrors.Failure.http(500)) {
+            _ = try await client.fetch(Thing.self, path: "/things/1")
+        }
+        #expect(transport.requestCount == 1)
+    }
+
+    @Test
+    func `a terminal rate limit publishes a cooldown for a later request`() async throws {
         let clock = TestClock()
         let sleeper = ControlledSleeper()
         let transport = TerminalRateLimitTransport()
@@ -1061,14 +1128,12 @@ struct RateLimitRetryTests {
 
         let next = try client.authorizedGET(try #require(URL(string: "https://example.test/next")))
         let task = Task { try await client.performWithRetry(Thing.self, request: next, maxAttempts: 1) }
-        while transport.requestCount(path: "/next") == 0, sleeper.requestedDelays.isEmpty {
-            await Task.yield()
-        }
-        #expect(sleeper.requestedDelays.isEmpty)
-        if !sleeper.requestedDelays.isEmpty {
-            clock.advance(by: 60)
-            sleeper.resumeAll()
-        }
+        #expect(await waitUntil {
+            transport.requestCount(path: "/next") > 0 || !sleeper.requestedDelays.isEmpty
+        })
+        #expect(sleeper.requestedDelays == [60])
+        clock.advance(by: 60)
+        sleeper.resumeAll()
         #expect(try await task.value == Thing(id: 1))
     }
 
@@ -1079,7 +1144,7 @@ struct RateLimitRetryTests {
         let request = try client.authorizedGET(#require(URL(string: "https://example.test/things/1")))
         let task = Task { try await client.performWithRetry(Thing.self, request: request) }
 
-        while transport.requestCount == 0 { await Task.yield() }
+        #expect(await waitUntil { transport.requestCount > 0 })
         task.cancel()
 
         await #expect(throws: CancellationError.self) { try await task.value }
@@ -1101,7 +1166,7 @@ struct RateLimitRetryTests {
         )
         let task = Task { try await client.fetchAllPages(ThingsPage.self, path: "/things/") }
 
-        while sleeper.requestedDelays.count < 2 { await Task.yield() }
+        #expect(await waitUntil { sleeper.requestedDelays.count >= 2 })
         #expect(sleeper.requestedDelays == [10, 10])
         #expect(transport.requestCount(for: 2) == 1)
         #expect(transport.requestCount(for: 3) == 1)
@@ -1323,7 +1388,7 @@ private nonisolated struct ZeroPageSize: PagedResponse {
 }
 
 /// Serves sequential pages from a fixed chain of JSON bodies, keyed by request order.
-private nonisolated struct SequentialJSONTransport: RESTTransport {
+private nonisolated struct SequentialJSONTransport: LegacyRESTTransport {
     let pages: [String]
     let captured: CapturedRequests
 
@@ -1334,7 +1399,7 @@ private nonisolated struct SequentialJSONTransport: RESTTransport {
     }
 }
 
-private nonisolated struct CapturingFixedTransport: RESTTransport {
+private nonisolated struct CapturingFixedTransport: LegacyRESTTransport {
     let inner: FixedResponseTransport
     let captured: CapturedRequests
 
@@ -1345,7 +1410,7 @@ private nonisolated struct CapturingFixedTransport: RESTTransport {
 }
 
 /// Parallel-aware stub: page 1 is fixed JSON; later `page` query values are served from `later`.
-private nonisolated struct FirstThenNumberedTransport: RESTTransport {
+private nonisolated struct FirstThenNumberedTransport: LegacyRESTTransport {
     let first: String
     let later: [Int: String]
     let captured: CapturedRequests
@@ -1613,7 +1678,7 @@ struct PaginationIssueRegressionTests {
     }
 }
 
-private nonisolated struct CancellationProbeTransport: RESTTransport {
+private nonisolated struct CancellationProbeTransport: LegacyRESTTransport {
     func data(for _: RESTRequest) async throws -> (Data, Int) {
         throw CancellationError()
     }
@@ -1630,6 +1695,104 @@ private struct BroadlyTransientErrors: RESTTransportErrorMapping {
 
 @Suite("Client open-issue regressions")
 struct ClientIssueRegressionTests {
+    @Test
+    func `fetch merges per-request headers and preserves protected authorization`() async throws {
+        let captured = CapturedRequests()
+        let client = makeClient(
+            transport: CapturingFixedTransport(
+                inner: FixedResponseTransport(data: Data(#"{"id":1}"#.utf8), status: 200),
+                captured: captured
+            )
+        )
+
+        _ = try await client.fetch(
+            Thing.self,
+            path: "/things?state=open",
+            headers: [
+                "If-None-Match": "\"v1\"",
+                "Authorization": "Bearer attacker",
+                "Accept": "application/vnd.example+json"
+            ]
+        )
+
+        #expect(captured.values.count == 1)
+        let request = try #require(captured.values.first)
+        #expect(request.url.path == "/things")
+        #expect(URLComponents(url: request.url, resolvingAgainstBaseURL: false)?
+            .queryItems?.first(where: { $0.name == "state" })?.value == "open")
+        #expect(request.headers["If-None-Match"] == "\"v1\"")
+        #expect(request.headers["Accept"] == "application/vnd.example+json")
+        #expect(request.headers["Authorization"] == "Bearer test-key")
+    }
+
+    @Test
+    func `empty paths preserve the configured route exactly`() async throws {
+        let captured = CapturedRequests()
+        let base = try #require(URL(string: "https://example.test/api"))
+        let client = makeClient(
+            transport: CapturingFixedTransport(
+                inner: FixedResponseTransport(data: Data(#"{"id":1}"#.utf8), status: 200),
+                captured: captured
+            ),
+            baseURL: base
+        )
+
+        _ = try await client.fetch(Thing.self, path: "")
+        #expect(captured.values.first?.url == base)
+    }
+
+    @Test
+    func `send treats a path query as a query instead of path text`() async throws {
+        let captured = CapturedRequests()
+        let client = makeClient(
+            transport: CapturingFixedTransport(
+                inner: FixedResponseTransport(data: Data(#"{"id":1}"#.utf8), status: 200),
+                captured: captured
+            )
+        )
+
+        _ = try await client.send(Thing.self, method: "POST", path: "/things?dry_run=true", body: ["id": 1])
+        #expect(captured.values.count == 1)
+        let request = try #require(captured.values.first)
+        #expect(request.url.path == "/things")
+        #expect(request.url.absoluteString.contains("%3F") == false)
+        #expect(URLComponents(url: request.url, resolvingAgainstBaseURL: false)?
+            .queryItems?.first(where: { $0.name == "dry_run" })?.value == "true")
+    }
+
+    @Test
+    func `authorized request builds bodyless and file-backed requests safely`() throws {
+        let client = makeClient()
+        let headers = ["Authorization": "Bearer attacker", "X-Request-ID": "abc"]
+        let request = try client.authorizedRequest(method: "DELETE", path: "/things/1", headers: headers)
+        #expect(request.headers["Authorization"] == "Bearer test-key")
+        #expect(request.headers["X-Request-ID"] == "abc")
+        #expect(request.body == nil)
+
+        let bodyFileURL = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        let fileRequest = try client.authorizedRequest(
+            method: "PUT",
+            path: "/upload",
+            bodyFileURL: bodyFileURL
+        )
+        #expect(fileRequest.bodyFileURL == bodyFileURL)
+    }
+
+    @Test
+    func `the client rejects conflicting body sources before a custom transport`() async throws {
+        let transport = CountingStatusTransport(status: 200)
+        let request = RESTRequest(
+            url: try #require(URL(string: "https://example.test/upload")),
+            method: "PUT",
+            body: Data([1]),
+            bodyFileURL: FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        )
+        await #expect(throws: TestErrors.Failure.invalidRequest) {
+            _ = try await makeClient(transport: transport).perform(Thing.self, request: request)
+        }
+        #expect(transport.requestCount == 0)
+    }
+
     @Test
     func `error body truncation does not split a multibyte UTF-8 scalar`() {
         // Cap after the lead byte of "é" (C3 A9) so a naive byte prefix would be invalid.
