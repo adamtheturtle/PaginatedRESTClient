@@ -71,6 +71,31 @@ private nonisolated struct RejectingValue: Decodable, Sendable {
     }
 }
 
+private nonisolated final class PriorityRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var priorities: [TaskPriority] = []
+
+    func record(_ priority: TaskPriority) {
+        lock.withLock { priorities.append(priority) }
+    }
+
+    func reset() {
+        lock.withLock { priorities.removeAll() }
+    }
+
+    var last: TaskPriority? {
+        lock.withLock { priorities.last }
+    }
+}
+
+private nonisolated let decodePriorityRecorder = PriorityRecorder()
+
+private nonisolated struct PriorityRecordingValue: Decodable, Sendable {
+    init(from _: any Decoder) {
+        decodePriorityRecorder.record(Task.currentPriority)
+    }
+}
+
 private nonisolated struct Thing: Decodable, Equatable {
     let id: Int
 }
@@ -663,6 +688,22 @@ struct PaginatedRESTClientTests {
     }
 
     @Test
+    func `response decoding inherits background caller priority`() async throws {
+        decodePriorityRecorder.reset()
+        let task = Task(priority: .background) {
+            try await makeClient(
+                transport: FixedResponseTransport(data: Data("{}".utf8), status: 200)
+            ).perform(
+                PriorityRecordingValue.self,
+                request: RESTRequest(url: URL(string: "https://example.test/value")!, method: "GET")
+            )
+        }
+        #expect(await waitUntil { decodePriorityRecorder.last != nil })
+        #expect(decodePriorityRecorder.last == .background)
+        _ = try await task.value
+    }
+
+    @Test
     func `streamAllPages emits a growing prefix, page one first`() async throws {
         var snapshots: [[Thing]] = []
         for try await snapshot in makeClient().streamAllPages(ThingsPage.self, path: "/things/") {
@@ -999,6 +1040,24 @@ struct RateLimitRetryTests {
         #expect(PaginatedRESTClient.retryAfterDelay("not a date", relativeTo: now) == nil)
         #expect(PaginatedRESTClient.retryAfterDelay("-1", relativeTo: now) == nil)
         #expect(PaginatedRESTClient.retryAfterDelay(String(repeating: "9", count: 400), relativeTo: now) == nil)
+    }
+
+    @Test
+    func `absolute Retry-After uses the server Date despite client clock skew`() throws {
+        let clientNow = try #require(PaginatedRESTClient.parseHTTPDate(
+            "Sun, 06 Nov 1994 08:59:07 GMT",
+            relativeTo: Date()
+        ))
+        let response = RESTResponse(
+            data: Data(),
+            statusCode: 429,
+            headers: [
+                "Date": "Sun, 06 Nov 1994 08:49:07 GMT",
+                "Retry-After": "Sun, 06 Nov 1994 08:49:37 GMT"
+            ]
+        )
+
+        #expect(PaginatedRESTClient.retryAfterDelay(from: response, receivedAt: clientNow) == 30)
     }
 
     @Test
@@ -1504,8 +1563,202 @@ private nonisolated struct FirstThenNumberedTransport: LegacyRESTTransport {
     }
 }
 
+private nonisolated final class PageGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var released = false
+
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            let resumeNow = lock.withLock {
+                if released { return true }
+                self.continuation = continuation
+                return false
+            }
+            if resumeNow { continuation.resume() }
+        }
+    }
+
+    func release() {
+        let continuation = lock.withLock {
+            released = true
+            let continuation = self.continuation
+            self.continuation = nil
+            return continuation
+        }
+        continuation?.resume()
+    }
+}
+
+private nonisolated struct SlowSecondPageTransport: LegacyRESTTransport {
+    let pageCount: Int
+    let gate: PageGate
+    let log: RequestLog
+
+    func data(for request: RESTRequest) async throws -> (Data, Int) {
+        let page = URLComponents(url: request.url, resolvingAgainstBaseURL: false)?
+            .queryItems?.first { $0.name == "page" }?.value.flatMap(Int.init) ?? 1
+        log.record(page: page, onMainThread: isOnMainThread())
+        if page == 2 { await gate.wait() }
+        let next = page < pageCount ? #""?page=\#(page + 1)""# : "null"
+        let json = #"{"things":[{"id":\#(page)}],"next_page":\#(next),"total":\#(pageCount * 2)}"#
+        return (Data(json.utf8), 200)
+    }
+}
+
 @Suite("Pagination open-issue regressions")
 struct PaginationIssueRegressionTests {
+    @Test
+    func `page construction preserves raw query bytes and case-sensitive names`() async throws {
+        let captured = CapturedRequests()
+        let base = try #require(URL(string:
+            "https://example.test/things?sig=a%2fb&Page=summary&Sort=keep"
+        ))
+        let first = """
+        {"things":[{"id":1}],"next_page":"?page=2&snapshot=x%2fy","total":3}
+        """
+        let second = #"{"things":[{"id":2},{"id":3}],"next_page":null,"total":3}"#
+        _ = try await makeClient(
+            transport: FirstThenNumberedTransport(
+                first: first,
+                later: [2: second],
+                captured: captured
+            ),
+            baseURL: base
+        ).fetchAllPages(ThingsPage.self, path: "", sort: "new")
+
+        #expect(captured.values.count == 2)
+        #expect(captured.values[0].url.absoluteString.contains("sig=a%2fb"))
+        #expect(captured.values[0].url.absoluteString.contains("Page=summary"))
+        #expect(captured.values[0].url.absoluteString.contains("Sort=keep"))
+        #expect(captured.values[1].url.absoluteString.contains("sig=a%2fb"))
+        #expect(captured.values[1].url.absoluteString.contains("snapshot=x%2fy"))
+        #expect(captured.values[1].url.absoluteString.contains("page=2"))
+    }
+
+    @Test
+    func `a total-bearing cursor response stays on sequential traversal`() async throws {
+        let captured = CapturedRequests()
+        let pages = [
+            #"{"things":[{"id":1}],"next_page":"?cursor=abc","total":20}"#,
+            #"{"things":[{"id":2}],"next_page":null,"total":20}"#
+        ]
+        let items = try await makeClient(
+            transport: SequentialJSONTransport(pages: pages, captured: captured)
+        ).fetchAllPages(ThingsPage.self, path: "/things/")
+
+        #expect(items == things(1 ... 2))
+        #expect(captured.values.count == 2)
+        #expect(captured.values[1].url.query == "cursor=abc")
+    }
+
+    @Test
+    func `server pagination fields survive numbered page construction`() async throws {
+        let captured = CapturedRequests()
+        let first = """
+        {"things":[{"id":1}],"next_page":"?page=2&snapshot=abc&per_page=2","total":3}
+        """
+        let later = #"{"things":[{"id":2},{"id":3}],"next_page":null,"total":3}"#
+        _ = try await makeClient(
+            transport: FirstThenNumberedTransport(first: first, later: [2: later], captured: captured)
+        ).fetchAllPages(ThingsPage.self, path: "/things/")
+
+        let query = try #require(URLComponents(
+            url: captured.values[1].url,
+            resolvingAgainstBaseURL: false
+        )?.queryItems)
+        #expect(query.contains(URLQueryItem(name: "snapshot", value: "abc")))
+        #expect(query.contains(URLQueryItem(name: "per_page", value: "2")))
+    }
+
+    @Test
+    func `duplicate page controls in a tail link are rejected`() async throws {
+        let captured = CapturedRequests()
+        let first = #"{"things":[{"id":1}],"next_page":"?page=2","total":3}"#
+        let second = """
+        {"things":[{"id":2}],"next_page":"?page=3&page=2","total":3}
+        """
+        await #expect(throws: TestErrors.Failure.invalidRequest) {
+            _ = try await makeClient(
+                transport: FirstThenNumberedTransport(
+                    first: first,
+                    later: [2: second],
+                    captured: captured
+                )
+            ).fetchAllPages(ThingsPage.self, path: "/things/")
+        }
+        #expect(captured.values.count == 2)
+    }
+
+    @Test
+    func `parallel pages count against the sequential tail limit`() async throws {
+        let captured = CapturedRequests()
+        let first = #"{"things":[{"id":1}],"next_page":"?page=2","total":3}"#
+        let second = #"{"things":[{"id":2}],"next_page":"?page=3","total":3}"#
+        await #expect(throws: TestErrors.Failure.invalidRequest) {
+            _ = try await makeClient(
+                transport: FirstThenNumberedTransport(
+                    first: first,
+                    later: [2: second],
+                    captured: captured
+                ),
+                maxSequentialPages: 2
+            ).fetchAllPages(ThingsPage.self, path: "/things/")
+        }
+        #expect(captured.values.count == 2)
+    }
+
+    @Test
+    func `a sequential tail cannot re-enter a parallel page`() async throws {
+        let captured = CapturedRequests()
+        let pages = [
+            #"{"things":[{"id":1}],"next_page":"?page=2","total":3}"#,
+            #"{"things":[{"id":2}],"next_page":"?page=3","total":3}"#,
+            #"{"things":[{"id":3}],"next_page":"?page=2","total":3}"#
+        ]
+        await #expect(throws: TestErrors.Failure.invalidRequest) {
+            _ = try await makeClient(
+                transport: SequentialJSONTransport(pages: pages, captured: captured)
+            ).fetchAllPages(ThingsPage.self, path: "/things/")
+        }
+        #expect(captured.values.count == 3)
+    }
+
+    @Test
+    func `a slow early page bounds the parallel reorder window`() async throws {
+        let gate = PageGate()
+        let log = RequestLog()
+        let task = Task {
+            try await makeClient(
+                transport: SlowSecondPageTransport(pageCount: 20, gate: gate, log: log)
+            ).fetchAllPages(ThingsPage.self, path: "/things/")
+        }
+
+        #expect(await waitUntil { log.requestedPages.count >= 9 })
+        try await Task.sleep(for: .milliseconds(30))
+        #expect(log.requestedPages.count == 9)
+        gate.release()
+        let items = try await task.value
+        #expect(items.count == 20)
+    }
+
+    @Test
+    func `an intermediate terminal page discards later speculation`() async throws {
+        let captured = CapturedRequests()
+        let first = #"{"things":[{"id":1}],"next_page":"?page=2","total":5}"#
+        let page2 = #"{"things":[{"id":2}],"next_page":null,"total":5}"#
+        let page3 = #"{"things":[{"id":3}],"next_page":null,"total":5}"#
+        let items = try await makeClient(
+            transport: FirstThenNumberedTransport(
+                first: first,
+                later: [2: page2, 3: page3],
+                captured: captured
+            )
+        ).fetchAllPages(ThingsPage.self, path: "/things/")
+
+        #expect(items == things(1 ... 2))
+    }
+
     @Test
     func `reordered query forms share a canonical page identity`() throws {
         let client = makeClient()
@@ -1581,7 +1834,7 @@ struct PaginationIssueRegressionTests {
     @Test
     func `an empty first page with a positive total still fetches later pages`() async throws {
         let captured = CapturedRequests()
-        let first = #"{"things":[],"next_page":null,"total":20}"#
+        let first = #"{"things":[],"next_page":"?page=2","total":20}"#
         let page2 = """
         {"things":[{"id":11},{"id":12},{"id":13},{"id":14},{"id":15},\
         {"id":16},{"id":17},{"id":18},{"id":19},{"id":20}],"next_page":null,"total":20}

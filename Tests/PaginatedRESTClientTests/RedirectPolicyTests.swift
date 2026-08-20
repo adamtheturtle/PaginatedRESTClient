@@ -43,6 +43,43 @@ struct RedirectPolicyTests {
     }
 
     @Test
+    func `unauthenticated requests may follow safe cross-origin redirects`() async throws {
+        let origin = URL(string: "https://api.example.test/public")!
+        let delegate = SameOriginRedirectDelegate(
+            requestURL: origin,
+            requiresSameOrigin: false,
+            forwardingDelegate: nil
+        )
+        let task = URLSession.shared.dataTask(with: origin)
+        defer { task.cancel() }
+        let response = try #require(HTTPURLResponse(
+            url: origin,
+            statusCode: 302,
+            httpVersion: "HTTP/1.1",
+            headerFields: nil
+        ))
+        let publicRequest = URLRequest(url: URL(string: "https://cdn.example.test/object")!)
+        var credentialedRequest = publicRequest
+        credentialedRequest.setValue("Bearer secret", forHTTPHeaderField: "Authorization")
+
+        let accepted = await redirectDecision(
+            from: delegate,
+            task: task,
+            response: response,
+            request: publicRequest
+        )
+        let rejected = await redirectDecision(
+            from: delegate,
+            task: task,
+            response: response,
+            request: credentialedRequest
+        )
+
+        #expect(accepted?.url == publicRequest.url)
+        #expect(rejected == nil)
+    }
+
+    @Test
     func `cross-origin delayed request substitutions are cancelled`() async {
         let origin = URL(string: "https://api.example.test/v1/resources")!
         let replacement = URLRequest(url: URL(string: "https://attacker.example/resources")!)
