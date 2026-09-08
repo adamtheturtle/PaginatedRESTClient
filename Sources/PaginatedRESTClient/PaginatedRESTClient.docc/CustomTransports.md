@@ -8,77 +8,69 @@ public protocol RESTTransport: Sendable {
 }
 ```
 
-A transport executes a ``RESTRequest`` and returns the response body, HTTP status code, and
-headers. The paginator uses `Retry-After` to coordinate rate-limit cooldowns across concurrent
-page requests. Implement `response(for:)` directly for every new transport. The convenience
-`data(for:)` projection remains available when a caller does not need headers. Legacy transports
-can temporarily conform to `LegacyRESTTransport`, whose one-way adapter supplies
-an empty header collection.
+A transport executes a ``RESTRequest`` and returns the response body, HTTP status code, and headers.
+The paginator uses `Retry-After` to coordinate rate-limit cooldowns across concurrent page requests.
+Implement `response(for:)` directly for every new transport.
+The convenience `data(for:)` projection remains available when a caller does not need headers.
+Legacy transports can temporarily conform to `LegacyRESTTransport`, whose one-way adapter supplies an empty header collection.
 
-That's the whole contract - **no decoding, no retry, no auth.** All of that stays in the
-paginator, so a transport is a thin translation from ``RESTRequest`` to whatever your HTTP
-client understands and back.
+That's the whole contract - **no decoding, no retry, no auth.**
+All of that stays in the paginator, so a transport is a thin translation from ``RESTRequest`` to whatever your HTTP client understands and back.
 
-The package ships ``URLSessionTransport`` as the batteries-included default and depends only
-on Foundation. The adapters below show how to layer the paginator over two popular HTTP
-clients **without making either a dependency of this package** - drop the snippet into your
-own app or a small wrapper module that already depends on the client.
+The package ships ``URLSessionTransport`` as the batteries-included default and depends only on Foundation.
+The adapters below show how to layer the paginator over two popular HTTP clients **without making either a dependency of this package** - drop the snippet into your own app or a small wrapper module that already depends on the client.
 
 ## Three things worth getting right
 
-- **Response, don't throw, for non-2xx.** The paginator decides what a 404 or 500 means via
-  your ``RESTTransportErrorMapping``. A transport should return a ``RESTResponse`` for any
-  completed HTTP response and only throw for genuine transport failures (offline, timeout).
-- **Retain headers.** Copy response headers into ``RESTResponse`` so 429 retries can
-  honor `Retry-After`. Header lookup in ``RESTResponse`` is case-insensitive.
-- **Rethrow the underlying `URLError`.** The paginator routes a thrown `URLError` through
-  your error mapping's `network(_:)` case (and your `isTransient(_:)` decides whether to
-  retry). Clients that wrap transport errors in their own type should unwrap back to
-  `URLError` so that mapping keeps working.
+- **Response, don't throw, for non-2xx.**
+  The paginator decides what a 404 or 500 means via your ``RESTTransportErrorMapping``.
+  A transport should return a ``RESTResponse`` for any completed HTTP response and only throw for genuine transport failures (offline, timeout).
+- **Retain headers.**
+  Copy response headers into ``RESTResponse`` so 429 retries can honor `Retry-After`.
+  Header lookup in ``RESTResponse`` is case-insensitive.
+- **Rethrow the underlying `URLError`.**
+  The paginator routes a thrown `URLError` through your error mapping's `network(_:)` case (and your `isTransient(_:)` decides whether to retry).
+  Clients that wrap transport errors in their own type should unwrap back to `URLError` so that mapping keeps working.
 
 ## Redirect credential safety
 
-``PaginatedRESTClient/authorizedGET(_:)`` and the other authenticated builders validate only
-the *initial* URL. Once a ``RESTRequest`` is handed to your transport, **redirect handling is
-entirely yours.**
+``PaginatedRESTClient/authorizedGET(_:)`` and the other authenticated builders validate only the *initial* URL.
+Once a ``RESTRequest`` is handed to your transport, **redirect handling is entirely yours.**
 
 If the request carries `Authorization` (or any other secret header), a transport must either:
 
-1. Refuse redirects that leave the request's HTTP(S) origin (scheme, host, and effective port),
-   including destinations that add URL userinfo, or
+1. Refuse redirects that leave the request's HTTP(S) origin (scheme, host, and effective port), including destinations that add URL userinfo, or
 2. Strip credential headers before following a cross-origin redirect.
 
-``URLSessionTransport`` does (1) through ``SameOriginRedirectDelegate``. A literal adapter
-that blindly replays the original ``RESTRequest/headers`` on every hop can reintroduce a
-credential leak. Treat same-origin redirect policy as part of the ``RESTTransport`` contract,
-not an optional URLSession detail.
+``URLSessionTransport`` does (1) through ``SameOriginRedirectDelegate``.
+A literal adapter that blindly replays the original ``RESTRequest/headers`` on every hop can reintroduce a credential leak.
+Treat same-origin redirect policy as part of the ``RESTTransport`` contract, not an optional URLSession detail.
 
 ## `URLSessionTransport` session and delegate contract
 
-``URLSessionTransport`` always runs requests on the **supplied** `URLSession`. It installs a
-task-specific bounded data delegate so response bodies are collected in chunks with the
-configured byte ceilings. That means:
+``URLSessionTransport`` always runs requests on the **supplied** `URLSession`.
+It installs a task-specific bounded data delegate so response bodies are collected in chunks with the configured byte ceilings.
+That means:
 
-- **Session lifecycle.** Invalidating or cancelling the session you pass in stops further
-  transport work on every platform. The transport does not create a replacement session.
-- **Connection pooling.** Sequential and concurrent page fetches reuse the supplied session's
-  connections (including on Linux).
-- **Delegate identity.** Forwarded `URLSessionDelegate` callbacks receive the supplied session
-  instance, so policy keyed on session identity keeps working.
-- **Response disposition.** Only `.allow` and `.cancel` are honored. If a data delegate returns
-  `.becomeDownload` or `.becomeStream`, the transport coerces the disposition to `.allow` and
-  continues as a bounded data task so a ``RESTResponse`` can still be produced.
-- **Cancellation.** Cancelling the Swift task cancels the underlying `URLSessionDataTask` without
-  invalidating the shared session.
+- **Session lifecycle.**
+  Invalidating or cancelling the session you pass in stops further transport work on every platform.
+  The transport does not create a replacement session.
+- **Connection pooling.**
+  Sequential and concurrent page fetches reuse the supplied session's connections (including on Linux).
+- **Delegate identity.**
+  Forwarded `URLSessionDelegate` callbacks receive the supplied session instance, so policy keyed on session identity keeps working.
+- **Response disposition.**
+  Only `.allow` and `.cancel` are honored.
+  If a data delegate returns `.becomeDownload` or `.becomeStream`, the transport coerces the disposition to `.allow` and continues as a bounded data task so a ``RESTResponse`` can still be produced.
+- **Cancellation.**
+  Cancelling the Swift task cancels the underlying `URLSessionDataTask` without invalidating the shared session.
 
-Task-level callbacks that exist on the current SDK (including waiting-for-connectivity and
-informational HTTP responses) are forwarded to the supplied session delegate when present.
+Task-level callbacks that exist on the current SDK (including waiting-for-connectivity and informational HTTP responses) are forwarded to the supplied session delegate when present.
 
 ## Get (kean/Get)
 
-[Get](https://github.com/kean/Get) is a thin async wrapper over `URLSession`. Its
-`APIClient.data(for:)` returns the raw bytes plus the `URLResponse`, which is exactly what
-the transport contract needs.
+[Get](https://github.com/kean/Get) is a thin async wrapper over `URLSession`.
+Its `APIClient.data(for:)` returns the raw bytes plus the `URLResponse`, which is exactly what the transport contract needs.
 
 ```swift
 import Foundation
@@ -131,16 +123,13 @@ struct GetTransport: RESTTransport {
 // let client = PaginatedRESTClient(apiKey: token, baseURL: base, transport: transport, …)
 ```
 
-> Get validates non-2xx responses through its `APIClientDelegate` by default. Configure a
-> delegate that permits HTTP responses so this adapter can return their status and body to the
-> paginator's error mapping.
+> Get validates non-2xx responses through its `APIClientDelegate` by default.
+> Configure a delegate that permits HTTP responses so this adapter can return their status and body to the paginator's error mapping.
 
 ## Alamofire
 
-[Alamofire](https://github.com/Alamofire/Alamofire) handles raw `Data` bodies directly, so
-the adapter builds a `URLRequest` and lets Alamofire run it. Crucially, **don't** add
-`.validate()` - we want the real status code back, not a thrown error, so the paginator's
-error mapping can classify it.
+[Alamofire](https://github.com/Alamofire/Alamofire) handles raw `Data` bodies directly, so the adapter builds a `URLRequest` and lets Alamofire run it.
+Crucially, **don't** add `.validate()` - we want the real status code back, not a thrown error, so the paginator's error mapping can classify it.
 
 ```swift
 import Alamofire
@@ -203,6 +192,4 @@ struct AlamofireTransport: RESTTransport {
 // let client = PaginatedRESTClient(apiKey: token, baseURL: base, transport: transport, …)
 ```
 
-For any other stack (an in-house client, gRPC-Web gateway, a record/replay fixture for
-tests) the recipe is the same: translate ``RESTRequest``, perform it, and return a
-``RESTResponse`` that retains the status and headers.
+For any other stack (an in-house client, gRPC-Web gateway, a record/replay fixture for tests) the recipe is the same: translate ``RESTRequest``, perform it, and return a ``RESTResponse`` that retains the status and headers.
