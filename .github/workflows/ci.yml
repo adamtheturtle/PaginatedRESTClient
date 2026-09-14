@@ -153,4 +153,6 @@ jobs:
       # Styles are vendored under ``vale/styles`` (issue #211); no ``vale sync`` download.
       # Null-delimited paths keep Markdown filenames with whitespace lintable (issue #161).
       - name: Lint prose
+        # The Python Vale wrapper may fail transiently while downloading its binary; see
+        # https://github.com/daniperez/vale-python-package/issues/77
         run: git ls-files -z -- '*.md' | xargs -0 --no-run-if-empty uvx vale@3.13.0.0
