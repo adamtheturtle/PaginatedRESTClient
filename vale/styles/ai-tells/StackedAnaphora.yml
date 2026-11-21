@@ -1,6 +1,6 @@
 ---
 extends: existence
-message: "AI anaphora: '%s'. Vary the sentence openings or combine into a single statement."
+message: "AI anaphora: '%s'. Vary the sentence openings or combine into one statement."
 level: error
 nonword: true
 tokens:
@@ -151,14 +151,14 @@ tokens:
   # === Indefinite-article exemplification stack ===
   # AI loves stacking hypothetical scenarios as parallel sentences:
   # "A hook wants to count failures. A subagent wants to record a
-  # result. A skill wants to stash a value." The shape — A/An +
+  # result. A skill wants to stash a value." The pattern — A/An +
   # noun (1-3 words) + present-tense verb — paired across 3
   # sentences is distinctive enough to flag even when verbs differ.
   - "\\b(?:A|An) \\w+(?: \\w+){0,2} \\w+s [^.]+\\. (?:A|An) \\w+(?: \\w+){0,2} \\w+s [^.]+\\. (?:A|An) \\w+(?: \\w+){0,2} \\w+s [^.!?]+"
 
   # 2-sentence parallel-mirror pair: "An unset X counts as Y.
   # A set-but-wrong value belongs to Z." Same A/An + NP + verb-s
-  # shape but paired instead of tripled. Common in technical prose
+  # pattern but paired instead of tripled. Common in technical prose
   # written by humans too, but the dramatic shared-verb framing
   # reads as an AI tell in practice.
   - "\\b(?:A|An) \\w+(?: \\w+){0,2} \\w+s [^.]+\\. (?:A|An) \\w+(?: \\w+){0,2} \\w+s [^.!?]+"
@@ -179,5 +179,18 @@ tokens:
   # verb would carry.
   - "\\bWhether [^.]+, or whether [^.!?]+\\."
 
-  # Two consecutive "Whether X." sentences — same shape, paired.
+  # Two consecutive "Whether X." sentences — same pattern, paired.
   - "\\bWhether [^.]+\\. Whether [^.]+\\."
+
+  # === Paired "For X, ... For Y," scope openers ===
+  # Two consecutive sentences each fronted by a "For <scope>," label:
+  # "For search, that join reverses. For writes, the table takes one
+  # append." The single fronted "For X," is ordinary English several
+  # hundred times over in the Go and Python standard libraries, so only
+  # the pair fires, and the discourse markers ("For example," "For now,"
+  # "For simplicity,") are excluded at either position. The pair matches
+  # one corpus hit with those out, the fmt docs ("For Scanln, it stops at
+  # newlines. For Scan,"), which is the construction itself and fires by
+  # design. ScopePartition owns the "On the X side," and "At X time,"
+  # spellings of the same move.
+  - "\\bFor (?!(?:example|instance|now|details|more|this|that|these|those|some|historical|backward|backwards|simplicity|performance|efficiency|convenience|consistency|compatibility|clarity|debugging|testing|security|reference|completeness|context|comparison|brevity|safety|starters|any|all|each|every|the|a|an|one|its|our|your|my|their|no|most|many|what|whatever)\\b)[A-Za-z][a-z-]*(?: [a-z-]+)?, [^.]+\\. For (?!(?:example|instance|now|details|more|this|that|these|those|some|historical|backward|backwards|simplicity|performance|efficiency|convenience|consistency|compatibility|clarity|debugging|testing|security|reference|completeness|context|comparison|brevity|safety|starters|any|all|each|every|the|a|an|one|its|our|your|my|their|no|most|many|what|whatever)\\b)[A-Za-z][a-z-]*(?: [a-z-]+)?,"

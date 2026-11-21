@@ -40,7 +40,7 @@ tokens:
   # ---- "This/That/It + copula + adjective" emphatic declarations ----
   # "This is key." "That's intentional." "It was deliberate."
   - "\\b(?:It|This|That)(?:'s| is| was) (?:key|crucial|critical|intentional|deliberate|powerful|elegant|subtle|clean|simple|clear|important|significant|telling|striking|notable|profound|revealing|transformative|remarkable|essential|fundamental|beautiful|paramount|vital|obvious|neat|real|enough)\\."
-  - "\\b(?:It|This|That)(?:'s| is| was) (?:by design|on purpose|no accident|no coincidence|worth it|worth noting|not optional)\\."
+  - "\\b(?:It|This|That)(?:'s| is| was) (?:by design|on purpose|no accident|no coincidence|not optional)\\."
 
   # ---- "They/These/Those + copula + adjective" ----
   # "These are thin." "Those were deliberate."
@@ -104,7 +104,7 @@ tokens:
   # "Stronger isolation, more lifecycle machinery."
   # "Faster delivery, fewer surprises."
   # Comparative adjective + 1-2 word noun, paired with another
-  # comparative + noun. The balanced tradeoff aphorism shape.
+  # comparative + noun. The balanced tradeoff aphorism pattern.
   - "\\b(?:Stronger|Weaker|Faster|Slower|Better|Worse|Cleaner|Simpler|Smaller|Larger|Bigger|Higher|Lower|Tighter|Looser|Smoother|Newer|Older|Richer|Leaner|Safer|Saner|More|Less|Fewer) [\\w-]+(?: [\\w-]+)?, (?:stronger|weaker|faster|slower|better|worse|cleaner|simpler|smaller|larger|bigger|higher|lower|tighter|looser|smoother|newer|older|richer|leaner|safer|saner|more|less|fewer) [\\w-]+(?: [\\w-]+)?\\."
 
   # "Just/Pure/Clean + noun" standalone fragments: "Pure orchestration." "Just data."
@@ -123,7 +123,8 @@ tokens:
   - "\\bWith \\w+(?:[ -]\\w+)?, \\w+\\."
 
   # ---- Dramatic codas: "And [short clause]." ----
-  # "And it shows." "And that's okay."
+  # "And it shows." "And that's okay." "And that's the point." is
+  # PointVerdict's.
   - "\\bAnd it shows\\."
   - "\\bAnd it works\\."
   - "\\bAnd it matters\\."
@@ -133,7 +134,6 @@ tokens:
   - "\\bAnd that'?s fine\\."
   - "\\bAnd that'?s enough\\."
   - "\\bAnd that'?s it\\."
-  - "\\bAnd that'?s the point\\."
 
   # ---- "Full stop" / "Period" as emphasis ----
   # Standalone one-word emphatic "Period." only; anchored to a sentence
@@ -150,8 +150,8 @@ tokens:
 
   # Bare "Not X." / "No X." standalone fragment: "Not now."
   # "No singleton." AI deploys these as one-word verdicts — a tiny
-  # period-bound answer that the surrounding prose pretends to be
-  # responding to. The broader regex catches both negation forms
+  # period-bound answer to a question the surrounding prose never
+  # asked. The broader regex catches both negation forms
   # with any single-word tail. Some conversational fragments
   # ("No idea.", "No way.", "Not bad.") fire too; acceptable for
   # an error-level rule in technical-doc contexts.
@@ -170,7 +170,7 @@ tokens:
   # Verb-led contrastive with non-linking verbs + noun objects:
   # "They share a contract, not code."
   # "Custom signals belong in stderr text, not in the exit number."
-  # Different shape from the linking-verb family above — the object
+  # Different construction from the linking-verb family above — the object
   # is a noun phrase rather than an adjective.
   - "\\b[A-Z][a-z]+(?: \\w+){0,2} (?:shares?|keeps?|holds?|lives?|belongs?|sits?|points?|goes|go|gives?|takes?) (?:(?:in|on|to|at|with|for) )?[\\w-]+(?: [\\w-]+){0,3}, not (?:(?:in|on|to|at|with|for) )?[\\w-]+(?: [\\w-]+){0,3}[.:]"
 

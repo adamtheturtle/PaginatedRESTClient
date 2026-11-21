@@ -20,10 +20,10 @@ All of that stays in the paginator, so a transport is a thin translation from ``
 The package ships ``URLSessionTransport`` as the batteries-included default and depends only on Foundation.
 The adapters below show how to layer the paginator over two popular HTTP clients **without making either a dependency of this package** - drop the snippet into your own app or a small wrapper module that already depends on the client.
 
-## Three things worth getting right
+## Requirements for custom transports
 
 - **Response, don't throw, for non-2xx.**
-  The paginator decides what a 404 or 500 means via your ``RESTTransportErrorMapping``.
+  The paginator uses your ``RESTTransportErrorMapping`` to interpret a 404 or 500 response.
   A transport should return a ``RESTResponse`` for any completed HTTP response and only throw for genuine transport failures (offline, timeout).
 - **Retain headers.**
   Copy response headers into ``RESTResponse`` so 429 retries can honor `Retry-After`.
@@ -37,7 +37,7 @@ The adapters below show how to layer the paginator over two popular HTTP clients
 ``PaginatedRESTClient/authorizedGET(_:)`` and the other authenticated builders validate only the *initial* URL.
 Once a ``RESTRequest`` is handed to your transport, **redirect handling is entirely yours.**
 
-If the request carries `Authorization` (or any other secret header), a transport must either:
+If the request includes `Authorization` (or any other secret header), a transport must either:
 
 1. Refuse redirects that leave the request's HTTP(S) origin (scheme, host, and effective port), including destinations that add URL userinfo, or
 2. Strip credential headers before following a cross-origin redirect.
@@ -70,7 +70,7 @@ Task-level callbacks that exist on the current SDK (including waiting-for-connec
 ## Get (kean/Get)
 
 [Get](https://github.com/kean/Get) is a thin async wrapper over `URLSession`.
-Its `APIClient.data(for:)` returns the raw bytes plus the `URLResponse`, which is exactly what the transport contract needs.
+Its `APIClient.data(for:)` returns the raw bytes plus the `URLResponse`, as required by the transport contract.
 
 ```swift
 import Foundation
@@ -128,7 +128,8 @@ struct GetTransport: RESTTransport {
 
 ## Alamofire
 
-[Alamofire](https://github.com/Alamofire/Alamofire) handles raw `Data` bodies directly, so the adapter builds a `URLRequest` and lets Alamofire run it.
+[Alamofire](https://github.com/Alamofire/Alamofire) handles raw `Data` bodies.
+The adapter passes a `URLRequest` to Alamofire.
 Crucially, **don't** add `.validate()` - we want the real status code back, not a thrown error, so the paginator's error mapping can classify it.
 
 ```swift

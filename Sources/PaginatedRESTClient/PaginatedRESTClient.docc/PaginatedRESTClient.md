@@ -4,12 +4,12 @@ A pluggable Swift paginator for bearer-authenticated REST APIs.
 
 ## Overview
 
-`PaginatedRESTClient` turns a paginated REST endpoint into a single async call or a stream of growing snapshots.
+`PaginatedRESTClient` turns a paginated REST endpoint into one async call or a stream of growing snapshots.
 You provide the page model, error mapping, and optional transport; the client handles page traversal, concurrent fetches when the total is known, rate-limit-aware retry backoff, JSON decoding, and item de-duplication.
 
 Use the default ``URLSessionTransport`` for Foundation-only networking, or provide a custom ``RESTTransport`` adapter for another HTTP client.
 See <doc:CustomTransports> for Get and Alamofire examples.
-The default transport owns an ephemeral session, so it does not share the app's cookies or response cache.
+The default transport uses an ephemeral session independent of the app's cookies and response cache.
 Pass a configured `URLSession` when shared state is intentional.
 
 ### Response body limits
