@@ -152,5 +152,7 @@ jobs:
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
       # Styles are vendored under ``vale/styles`` (issue #211); no ``vale sync`` download.
       # Null-delimited paths keep Markdown filenames with whitespace lintable (issue #161).
+      - name: Check vendored Vale version
+        run: python3 scripts/vendor_vale_ai_tells.py --check
       - name: Lint prose
         run: git ls-files -z -- '*.md' | xargs -0 --no-run-if-empty uvx vale@3.26.0.1

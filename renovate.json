@@ -1,0 +1,29 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "customManagers:valeVersions"
+  ],
+  "enabledManagers": [
+    "custom.regex"
+  ],
+  "dependencyDashboard": {
+    "enabled": false
+  },
+  "automerge": false,
+  "packageRules": [
+    {
+      "matchPackageNames": [
+        "!tbhb/vale-ai-tells"
+      ],
+      "enabled": false
+    },
+    {
+      "matchPackageNames": [
+        "tbhb/vale-ai-tells"
+      ],
+      "prBodyNotes": [
+        "Run `python3 scripts/vendor_vale_ai_tells.py` to verify the release checksum and refresh the vendored files before merging."
+      ]
+    }
+  ]
+}
